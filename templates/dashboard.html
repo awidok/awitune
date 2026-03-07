@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🤖 Agent Orchestrator</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh}
+.hdr{background:linear-gradient(135deg,#1a1f36,#0d1117);border-bottom:1px solid #30363d;padding:10px 20px;display:flex;align-items:center;justify-content:space-between}
+.hdr h1{font-size:17px;color:#58a6ff}
+.hdr .ctl{display:flex;gap:8px;align-items:center;font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.g{background:#3fb950}.dot.r{background:#f85149}.dot.y{background:#d29922;animation:p 2s infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+.lay{display:grid;grid-template-columns:420px 1fr;gap:10px;padding:10px;height:calc(100vh - 48px)}
+.sb{display:flex;flex-direction:column;gap:10px;overflow:hidden}
+.mn{display:flex;flex-direction:column;gap:10px;overflow:hidden}
+.cd{background:#161b22;border:1px solid #30363d;border-radius:6px;overflow:hidden}
+.ch{padding:7px 10px;border-bottom:1px solid #30363d;font-size:12px;font-weight:600;color:#8b949e;display:flex;justify-content:space-between;align-items:center}
+.cb{padding:8px 10px;overflow-y:auto}
+.bs{text-align:center;padding:14px}
+.bs .v{font-size:38px;font-weight:700;color:#3fb950;font-family:monospace}
+.bs .l{font-size:10px;color:#8b949e;margin-top:2px}
+.lf{display:flex;flex-direction:column;gap:6px}
+.lf textarea{background:#0d1117;border:1px solid #30363d;color:#e1e4e8;border-radius:4px;padding:6px;font-size:12px;resize:vertical;min-height:50px;font-family:inherit}
+.lf textarea:focus{border-color:#58a6ff;outline:none}
+.lf .rw{display:flex;gap:6px}
+.lf input{background:#0d1117;border:1px solid #30363d;color:#e1e4e8;border-radius:4px;padding:5px 7px;font-size:11px;flex:1}
+.bt{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap}
+.bt:hover{background:#30363d}
+.bt.g{background:#238636;border-color:#2ea043;color:#fff}.bt.g:hover{background:#2ea043}
+.bt.r{background:#da3633;border-color:#f85149;color:#fff}.bt.r:hover{background:#f85149}
+.el{flex:1;overflow-y:auto}
+.ei{padding:7px 10px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:11px}
+.ei:hover{background:#1c2128}
+.ei.a{background:#1f2937;border-left:3px solid #58a6ff}
+.ei .n{font-weight:500}.ei .m{font-size:10px;color:#8b949e}
+.ei .s{font-family:monospace;font-weight:600}
+.s.ok{color:#3fb950}.s.fl{color:#f85149}.s.rn{color:#d29922}
+.gb{display:flex;gap:6px}
+.gc{flex:1;padding:6px;border-radius:4px;text-align:center;font-size:10px;font-weight:600}
+.gc.fr{background:#0d1117;border:1px solid #30363d;color:#8b949e}
+.gc.bu{background:#1c2128;border:1px solid #d29922;color:#d29922}
+.la{flex:1;min-height:0}
+.la .cb{height:calc(100% - 34px);font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;background:#0d1117;color:#c9d1d9}
+.tb{display:flex;gap:0}.t{padding:5px 12px;cursor:pointer;font-size:11px;color:#8b949e;border-bottom:2px solid transparent}
+.t:hover{color:#e1e4e8}.t.a{color:#58a6ff;border-bottom-color:#58a6ff}
+.qi{padding:5px 10px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center;font-size:11px}
+.qi .pr{color:#8b949e;font-size:10px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mt{display:flex;gap:6px;flex-wrap:wrap}
+.mc{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;min-width:90px}
+.mc .v{font-size:18px;font-weight:700;font-family:monospace}.mc .l{font-size:9px;color:#8b949e}
+.fi{padding:5px 10px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;cursor:pointer;font-size:12px}
+.fi:hover{background:#1c2128}.fi .sz{color:#8b949e;font-family:monospace;font-size:10px}
+</style></head><body>
+<div class="hdr"><h1>🤖 Agent Orchestrator</h1>
+<div class="ctl">
+<span id="ps"></span><span id="ws"></span><span id="afs"></span>
+<button class="bt" onclick="tw()" id="wb">Start Worker</button>
+<button class="bt" onclick="tp()" id="pb">Start Proxy</button>
+<button class="bt" onclick="taf()" id="afb">Auto-Feed</button>
+<button class="bt" onclick="showProxyLog()" style="font-size:10px">📋 Proxy Log</button>
+<button class="bt" onclick="rf()">↻</button>
+</div></div>
+<div class="lay">
+<div class="sb">
+<div class="cd"><div class="ch">🏆 Best Score</div><div class="cb bs"><div class="v" id="bv">—</div><div class="l">Best Score</div></div></div>
+<div class="cd"><div class="ch">🚀 Launch Agent</div><div class="cb"><div class="lf">
+<textarea id="pi" placeholder="Custom prompt (e.g. 'Try lower lr' or 'Add focal loss')"></textarea>
+<div class="rw">
+<select id="tti" style="background:#0d1117;border:1px solid #30363d;color:#e1e4e8;border-radius:4px;padding:5px 7px;font-size:11px;width:110px" onchange="onTaskTypeChange()">
+<option value="experiment">🧪 Experiment</option><option value="analysis">🔍 Analysis</option></select>
+<select id="bi" style="background:#0d1117;border:1px solid #30363d;color:#e1e4e8;border-radius:4px;padding:5px 7px;font-size:11px;flex:1.5;max-width:180px"><option value="">📦 Base: default</option></select>
+<input id="ni" placeholder="Name (opt)" style="flex:1">
+<button class="bt g" onclick="la()">Launch</button>
+</div>
+</div></div></div>
+<div class="cd"><div class="ch">🎮 GPUs <span id="gpuc"></span></div><div class="cb"><div class="gb" id="gbar"></div></div></div>
+<div class="cd" id="qc" style="display:none"><div class="ch">📋 Queue <span id="qn"></span></div><div class="cb" id="ql" style="max-height:100px;padding:0"></div></div>
+<div class="cd" style="flex:1;display:flex;flex-direction:column;min-height:0"><div class="ch">📊 Experiments <span id="ec"></span></div><div class="cb el" id="el" style="flex:1;padding:0"></div></div>
+</div>
+<div class="mn">
+<div class="mt" id="mb"></div>
+<div class="cd la" style="flex:1"><div class="ch">
+<div class="tb" id="lt"><div class="t a" data-t="agent">Agent Log</div><div class="t" data-t="events">Events</div><div class="t" data-t="tasks">Tasks</div><div class="t" data-t="workspace">Workspace</div><div class="t" data-t="output">Output</div><div class="t" data-t="reports">📊 Reports</div></div>
+<button class="bt" onclick="document.getElementById('lc').scrollTop=999999">↓</button></div>
+<div class="cb" id="lc">Select an experiment...</div></div>
+</div></div>
+<script>
+let sel=null,tab='agent',viewingFile=false;
+
+function fmtElapsed(startedAt){
+    if(!startedAt)return '...';
+    const start=new Date(startedAt);
+    const now=new Date();
+    const sec=Math.floor((now-start)/1000);
+    if(sec<0)return '0s';
+    const h=Math.floor(sec/3600);
+    const m=Math.floor((sec%3600)/60);
+    const s=sec%60;
+    if(h>0)return `${h}h ${m}m`;
+    if(m>0)return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+function fmtMin(min){
+    if(!min&&min!==0)return '—';
+    if(min<1)return '<1m';
+    if(min>=60)return `${Math.floor(min/60)}h ${Math.round(min%60)}m`;
+    return `${Math.round(min)}m`;
+}
+document.getElementById('lt').onclick=e=>{
+    if(!e.target.classList.contains('t'))return;
+    document.querySelectorAll('.t').forEach(t=>t.classList.remove('a'));
+    e.target.classList.add('a');tab=e.target.dataset.t;lt();
+};
+
+async function rf(){
+    try{
+        const r=await fetch('/api/state');const d=await r.json();
+        document.getElementById('bv').textContent=d.best_score>0?d.best_score.toFixed(6):'—';
+
+        // Worker status
+        const wsEl=document.getElementById('ws'),wbEl=document.getElementById('wb');
+        if(d.worker_running){wsEl.innerHTML='<span class="dot g"></span> Worker';wbEl.textContent='Stop Worker';wbEl.className='bt r'}
+        else{wsEl.innerHTML='<span class="dot r"></span> Worker';wbEl.textContent='Start Worker';wbEl.className='bt g'}
+
+        // Proxy status
+        const psEl=document.getElementById('ps'),pbEl=document.getElementById('pb');
+        if(d.proxy_running){psEl.innerHTML='<span class="dot g"></span> Proxy';pbEl.textContent='Stop Proxy';pbEl.className='bt r'}
+        else{psEl.innerHTML='<span class="dot r"></span> Proxy';pbEl.textContent='Start Proxy';pbEl.className='bt g'}
+
+        // Auto-feed status
+        const afsEl=document.getElementById('afs'),afbEl=document.getElementById('afb');
+        if(d.auto_feed_enabled){
+            afsEl.innerHTML=`<span class="dot g"></span> Ideas ${d.ideas_used||0}/${d.ideas_total||0}`;
+            afbEl.textContent='Stop Auto-Feed';afbEl.className='bt r';
+        } else {
+            afsEl.innerHTML='<span class="dot r"></span> Auto-Feed OFF';
+            afbEl.textContent='Start Auto-Feed';afbEl.className='bt g';
+        }
+
+        // GPUs
+        document.getElementById('gpuc').textContent=`${d.available_gpus.length-d.used_gpus.length}/${d.available_gpus.length} free`;
+        document.getElementById('gbar').innerHTML=d.available_gpus.map(g=>{
+            const busy=d.used_gpus.includes(g);
+            const info=busy?d.running[String(g)]:null;
+            return `<div class="gc ${busy?'bu':'fr'}">GPU ${g}${busy?'<br>'+(info?.name||'').slice(0,12):''}</div>`;
+        }).join('');
+
+        // Queue
+        if(d.queue.length>0){
+            document.getElementById('qc').style.display='';
+            document.getElementById('qn').textContent=`(${d.queue.length})`;
+            document.getElementById('ql').innerHTML=d.queue.map((q,i)=>
+                `<div class="qi"><span>${q.name}</span><span class="pr">${q.prompt||'default'}</span>
+                <button class="bt" onclick="rq(${i})" style="padding:2px 6px">✕</button></div>`
+            ).join('');
+        } else {
+            document.getElementById('qc').style.display='none';
+        }
+
+        // Experiments (from DB history + running)
+        let exps = d.history || [];
+        document.getElementById('ec').textContent=`(${exps.length})`;
+
+        document.getElementById('el').innerHTML=exps.map(e=>{
+            const active=sel===e.name?'a':'';
+            let sc='fl',sv='N/A';
+            const gpu = e.gpu_id ?? e.gpu ?? '?';
+            if(e.status==='running'){sc='rn';sv='⏳'}
+            else if(e.test_score && e.test_score > 0){
+                sv=parseFloat(e.test_score).toFixed(6);sc=e.improved?'ok':'';
+            }
+
+            let timeStr;
+            if(e.status==='running'){
+                timeStr=`<span style="color:#d29922">⏱ ${fmtElapsed(e.started_at)}</span>`;
+            } else if(e.elapsed_min){
+                timeStr=fmtMin(e.elapsed_min);
+            } else {
+                timeStr=e.status||'...';
+            }
+
+            const stopBtn=e.status==='running'?`<button class="bt r" onclick="event.stopPropagation();ke('${e.name}')" style="padding:1px 6px;font-size:10px" title="Stop">⏹</button>`:'';
+            const forkBtn=e.status==='completed'&&e.test_score&&e.task_type!=='analysis'?`<button class="bt" onclick="event.stopPropagation();fk('${e.name}')" style="padding:1px 6px;font-size:10px" title="Fork — use as base for new experiment">🍴</button>`:'';
+            const restartBtn=e.status!=='running'&&e.status!=='queued'?`<button class="bt" onclick="event.stopPropagation();re('${e.name}')" style="padding:1px 6px;font-size:10px" title="Restart">🔄</button>`:'';
+            const delBtn=`<button class="bt" onclick="event.stopPropagation();de('${e.name}')" style="padding:1px 6px;font-size:10px;margin-left:2px" title="Delete">🗑</button>`;
+            const parentTag=e.parent_experiment?`<span style="color:#58a6ff;font-size:9px" title="Based on ${e.parent_experiment}">← ${e.parent_experiment.slice(0,20)}</span>`:'';
+            const ttBadge=e.task_type==='analysis'?'<span style="background:#1f6feb;color:#fff;padding:0 4px;border-radius:3px;font-size:9px;margin-right:4px">🔍</span>':'';
+            return `<div class="ei ${active}" onclick="se('${e.name}')">
+                <div><div class="n">${ttBadge}${e.name}</div>
+                <div class="m">GPU ${gpu} · ${timeStr} ${parentTag}</div></div>
+                <div style="display:flex;align-items:center;gap:4px">
+                    <span class="s ${sc}">${sv}</span>
+                    ${stopBtn}${forkBtn}${restartBtn}${delBtn}
+                </div></div>`;
+        }).join('');
+
+        // Auto-select
+        if(!sel&&exps.length>0){
+            const run=exps.find(e=>e.status==='running');
+            se(run?run.name:exps[exps.length-1].name);
+        }
+
+        // Metrics for selected
+        if(sel){
+            const s=exps.find(e=>e.name===sel);
+            if(s){
+                let timeVal, timeColor='#d29922';
+                if(s.status==='running'){
+                    timeVal=fmtElapsed(s.started_at);
+                } else if(s.elapsed_min){
+                    timeVal=fmtMin(s.elapsed_min);
+                    timeColor='#8b949e';
+                } else {
+                    timeVal='—'; timeColor='#8b949e';
+                }
+
+                document.getElementById('mb').innerHTML=`
+                    <div class="mc"><div class="v" style="color:${s.test_score&&s.test_score!=='N/A'?'#3fb950':'#8b949e'}">${s.test_score&&s.test_score!=='N/A'?parseFloat(s.test_score).toFixed(6):'—'}</div><div class="l">Test Score</div></div>
+                    <div class="mc"><div class="v" style="color:#58a6ff">${s.val_score&&s.val_score!=='N/A'?parseFloat(s.val_score).toFixed(6):'—'}</div><div class="l">Val Score</div></div>
+                    <div class="mc"><div class="v" style="color:${timeColor}">${timeVal}</div><div class="l">${s.status==='running'?'Running for':'Time'}</div></div>
+                    <div class="mc"><div class="v" style="color:${s.exit_code===0?'#3fb950':s.status==='running'?'#d29922':'#f85149'}">${s.status==='running'?'⏳':(s.exit_code??'—')}</div><div class="l">Exit</div></div>
+                    ${s.parent_experiment?`<div class="mc" style="min-width:100px"><div class="v" style="font-size:12px;color:#58a6ff;cursor:pointer" onclick="se('${s.parent_experiment}')">← ${s.parent_experiment.slice(0,25)}</div><div class="l">Parent</div></div>`:''}
+                    ${s.prompt?`<div class="mc" style="min-width:200px;text-align:left"><div class="l">Prompt</div><div style="font-size:11px;color:#c9d1d9;margin-top:2px">${s.prompt.slice(0,100)}</div></div>`:''}
+                `;
+            }
+        }
+    }catch(e){console.error(e)}
+    // Only auto-refresh streaming tabs, not when viewing a specific file
+    if(!viewingFile && (tab==='agent'||tab==='proxy'||tab==='events'||tab==='tasks'||tab==='reports')) lt();
+}
+
+function se(name){sel=name;viewingFile=false;rf();lt()}
+
+async function lt(){
+    if(!sel)return;
+    viewingFile=false;
+    const lc=document.getElementById('lc');
+    try{
+        if(tab==='agent'){const r=await fetch(`/api/log/${sel}/agent`);lc.textContent=await r.text();lc.scrollTop=lc.scrollHeight}
+        else if(tab==='events'){
+            const r=await fetch(`/api/events/${sel}`);const d=await r.json();
+            if(!d.events||d.events.length===0){
+                lc.innerHTML='<div style="padding:10px;color:#8b949e">No events yet (agent uses stream-json output)</div>';
+            } else {
+                const colors={text:'#c9d1d9',tool_use:'#d29922',tool_result:'#58a6ff',result:'#3fb950',error:'#f85149',raw:'#8b949e'};
+                lc.innerHTML=`<div style="padding:4px 0;color:#8b949e;font-size:10px">${d.raw_lines} raw lines, ${d.events.length} events</div>`+
+                    d.events.map(ev=>{
+                        const c=colors[ev.type]||'#8b949e';
+                        let content='';
+                        if(ev.type==='text') content=`<span style="color:#8b949e">Turn ${ev.turn}:</span> ${ev.text}`;
+                        else if(ev.type==='tool_use') content=`<span style="color:#8b949e">Turn ${ev.turn}:</span> 🔧 <b>${ev.tool}</b> ${ev.input}`;
+                        else if(ev.type==='tool_result') content=`📋 ${ev.tool}: ${ev.output}`;
+                        else if(ev.type==='result') content=`✅ ${ev.text}`;
+                        else content=ev.raw||ev.text||JSON.stringify(ev);
+                        return `<div style="padding:3px 0;border-bottom:1px solid #21262d;color:${c};font-size:11px">[${ev.type}] ${content}</div>`;
+                    }).join('');
+                lc.scrollTop=lc.scrollHeight;
+            }
+        }
+        else if(tab==='tasks'){
+            const r=await fetch(`/api/tasks/${sel}`);const d=await r.json();
+            if(!d.tasks||d.tasks.length===0){
+                lc.innerHTML='<div style="padding:10px;color:#8b949e">No background tasks found</div>';
+            } else {
+                lc.innerHTML=d.tasks.map(t=>{
+                    const hasFile=d.task_files.includes(t.id);
+                    const statusIcon=hasFile?'📄':'⏳';
+                    const clickable=hasFile||d.container?`onclick="vtask('${sel}','${t.id}')" style="cursor:pointer"`:'';
+                    return `<div class="fi" ${clickable}>
+                        <span>${statusIcon} ${t.id}</span>
+                        <span class="sz">Turn ${t.turn}</span>
+                    </div>`;
+                }).join('');
+            }
+        }
+        else if(tab==='workspace'){
+            const r=await fetch(`/api/files/${sel}/workspace`);const d=await r.json();
+            lc.innerHTML=d.files.map(f=>`<div class="fi" onclick="vf('${sel}','workspace/${f.path}')"><span>${f.name}</span><span class="sz">${f.size}</span></div>`).join('')||'<div style="padding:10px;color:#8b949e">No files</div>';
+        }else if(tab==='output'){
+            const r=await fetch(`/api/files/${sel}/output`);const d=await r.json();
+            lc.innerHTML=d.files.map(f=>{
+                const dl=f.name==='submission.parquet'?`<button class="bt g" onclick="event.stopPropagation();window.location='/api/download/${sel}/submission'" style="padding:1px 8px;font-size:10px;margin-right:6px">⬇ Download</button>`:'';
+                return `<div class="fi" onclick="vf('${sel}','output/${f.path}')"><span>${f.name}</span><span>${dl}<span class="sz">${f.size}</span></span></div>`;
+            }).join('')||'<div style="padding:10px;color:#8b949e">No files</div>';
+        }else if(tab==='reports'){
+            const r=await fetch('/api/analyst_reports');const d=await r.json();
+            if(!d.reports||d.reports.length===0){
+                lc.innerHTML='<div style="padding:10px;color:#8b949e">No analyst reports yet. Launch an analysis task to generate one.</div>';
+            } else {
+                lc.innerHTML=d.reports.map(rp=>
+                    `<div class="fi" onclick="viewReport('${rp.name}')"><span>📊 ${rp.name}</span><span class="sz">${(rp.size/1024).toFixed(1)}KB · ${rp.modified.slice(0,16)}</span></div>`
+                ).join('');
+            }
+        }
+    }catch(e){lc.textContent='Error: '+e.message}
+}
+
+async function vf(exp,path){
+    viewingFile=true;
+    const lc=document.getElementById('lc');
+    try{const r=await fetch(`/api/file/${exp}?path=${encodeURIComponent(path)}`);lc.textContent=await r.text()}
+    catch(e){lc.textContent='Error: '+e.message}
+}
+
+async function vtask(exp,taskId){
+    viewingFile=true;
+    const lc=document.getElementById('lc');
+    try{
+        const r=await fetch(`/api/task_output/${exp}/${taskId}`);
+        const text=await r.text();
+        lc.innerHTML=`<div style="padding:4px 8px;background:#1c2128;border-bottom:1px solid #30363d;font-size:11px;color:#58a6ff;display:flex;justify-content:space-between">
+            <span>Task: ${taskId}</span>
+            <span><button class="bt" onclick="vtask('${exp}','${taskId}')" style="padding:1px 8px;font-size:10px">↻ Refresh</button>
+            <button class="bt" onclick="viewingFile=false;lt()" style="padding:1px 8px;font-size:10px">← Back</button></span>
+        </div><pre style="padding:8px;margin:0;white-space:pre-wrap;word-break:break-all;font-size:11px">${text.replace(/</g,'&lt;')}</pre>`;
+        lc.scrollTop=lc.scrollHeight;
+    }catch(e){lc.textContent='Error: '+e.message}
+}
+
+function onTaskTypeChange(){
+    const tt=document.getElementById('tti').value;
+    const bi=document.getElementById('bi');
+    const pi=document.getElementById('pi');
+    if(tt==='analysis'){
+        bi.style.display='none';
+        pi.placeholder='What to analyze? (e.g. "Find duplicate/correlated features" or "Analyze null patterns")';
+    } else {
+        bi.style.display='';
+        pi.placeholder="Custom prompt (e.g. 'Try lower lr' or 'Add focal loss')";
+    }
+}
+
+async function viewReport(name){
+    viewingFile=true;
+    const lc=document.getElementById('lc');
+    try{
+        const r=await fetch(`/api/analyst_reports/${name}`);
+        lc.textContent=await r.text();
+    }catch(e){lc.textContent='Error: '+e.message}
+}
+
+async function la(){
+    const prompt=document.getElementById('pi').value;
+    const name=document.getElementById('ni').value;
+    const base_experiment=document.getElementById('bi').value;
+    const task_type=document.getElementById('tti').value;
+    await fetch('/api/launch',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({prompt,name,base_experiment,task_type})});
+    document.getElementById('pi').value='';document.getElementById('ni').value='';
+    document.getElementById('bi').value='';document.getElementById('tti').value='experiment';
+    onTaskTypeChange();
+    rf();
+}
+
+function fk(expName){
+    const bi=document.getElementById('bi');
+    bi.value=expName;
+    // If the option doesn't exist yet (bases not loaded), add it temporarily
+    if(!bi.querySelector(`option[value="${expName}"]`)){
+        const opt=document.createElement('option');
+        opt.value=expName;opt.textContent=`🍴 ${expName}`;
+        bi.appendChild(opt);bi.value=expName;
+    }
+    document.getElementById('pi').focus();
+    document.getElementById('pi').placeholder=`Modify "${expName}" — e.g. "Try lower lr" or "Add dropout 0.3"`;
+}
+
+async function loadBases(){
+    try{
+        const r=await fetch('/api/experiments/bases');const d=await r.json();
+        const bi=document.getElementById('bi');
+        const cur=bi.value;
+        const opts=['<option value="">📦 Base: default</option>'];
+        for(const b of d.bases){
+            const score=b.test_score?parseFloat(b.test_score).toFixed(4):'?';
+            const star=b.improved?'★ ':'';
+            opts.push(`<option value="${b.name}">${star}${score} — ${b.name}</option>`);
+        }
+        bi.innerHTML=opts.join('');
+        if(cur)bi.value=cur;
+    }catch(e){}
+}
+
+async function rq(idx){
+    await fetch('/api/queue/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx})});
+    rf();
+}
+
+async function tw(){
+    const r=await fetch('/api/state');const d=await r.json();
+    if(d.worker_running)await fetch('/api/worker/stop',{method:'POST'});
+    else await fetch('/api/worker/start',{method:'POST'});
+    rf();
+}
+
+async function tp(){
+    const r=await fetch('/api/state');const d=await r.json();
+    if(d.proxy_running)await fetch('/api/proxy/stop',{method:'POST'});
+    else await fetch('/api/proxy/start',{method:'POST'});
+    rf();
+}
+
+async function ke(name){
+    if(!confirm('Stop agent '+name+'?'))return;
+    await fetch('/api/kill/'+name,{method:'POST'});
+    rf();
+}
+
+async function re(name){
+    if(!confirm('Restart experiment '+name+'?'))return;
+    const r=await fetch('/api/restart/'+name,{method:'POST'});
+    const d=await r.json();
+    if(d.id)se(d.id);
+    rf();
+}
+
+async function de(name){
+    if(!confirm('Delete experiment '+name+'? This cannot be undone.'))return;
+    await fetch('/api/delete/'+name,{method:'POST'});
+    if(sel===name)sel=null;
+    rf();
+}
+
+async function taf(){
+    await fetch('/api/autofeed/toggle',{method:'POST'});
+    rf();
+}
+
+async function showProxyLog(){
+    viewingFile=true;
+    const lc=document.getElementById('lc');
+    // Deselect all tabs
+    document.querySelectorAll('.t').forEach(t=>t.classList.remove('a'));
+    try{
+        const r=await fetch('/api/log/proxy');
+        lc.textContent=await r.text();
+        lc.scrollTop=lc.scrollHeight;
+    }catch(e){lc.textContent='Error: '+e.message}
+}
+
+rf();loadBases();setInterval(rf,5000);setInterval(loadBases,15000);
+</script></body></html>

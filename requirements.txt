@@ -1,0 +1,29 @@
+# Core ML
+torch
+polars
+numpy
+scikit-learn
+scipy
+
+# Gradient Boosting
+lightgbm
+xgboost
+catboost
+
+# Optimization
+optuna
+
+# Web/API
+flask
+flask-cors
+requests
+urllib3
+
+# Utils
+python-dotenv
+pyarrow
+pyyaml
+
+# Visualization
+tensorboard
+matplotlib

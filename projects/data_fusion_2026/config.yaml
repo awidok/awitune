@@ -1,0 +1,11 @@
+name: data-fusion-2026
+docker_image: data-fusion-agent
+
+test_metric_key: test_macro_roc_auc
+val_metric_key: val_macro_roc_auc
+metric_direction: maximize
+
+gpus: [0, 1, 2, 3, 4, 5]
+timeout_minutes: 480
+max_turns: 500
+proxy_port: 8081

@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (usually large)
+*.parquet
+*.csv
+*.json
+!projects/*/config.yaml
+!projects/*/data/feature_pruning.json
+!projects/*/data/split_indices.json
+
+# Models and checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+checkpoints/
+models/
+
+# Logs
+*.log
+logs/
+tb_logs/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Experiments (generated)
+projects/*/experiments/*/
+!projects/*/experiments/.gitkeep
+
+# Plans (generated)
+projects/*/plans/
+
+# Analyst reports (generated)
+projects/*/data/analyst_reports/
+
+# Output directories
+output/
+outputs/
+submissions/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.tar
