@@ -9,8 +9,13 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from . import db
-from .config import ProjectConfig
+try:
+    from . import db
+    from .config import ProjectConfig
+except ImportError:
+    # Allow running as script
+    import db
+    from config import ProjectConfig
 
 _cfg: Optional[ProjectConfig] = None
 
