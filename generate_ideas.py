@@ -284,7 +284,7 @@ def call_openai_with_tools(system: str, user: str, temperature: float = 0.7) -> 
             except json.JSONDecodeError:
                 arguments = {}
             
-            print(f"  Tool call: {tool_name}({arguments})")
+            print(f"  Tool call: {tool_name}({arguments})", flush=True)
             
             # Dispatch tool call
             result = dispatch_tool_call(tool_name, arguments)

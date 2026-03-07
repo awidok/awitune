@@ -34,6 +34,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 </div>
 <div id="graph"></div>
 <div class="legend">
+<div class="legend-item"><div class="legend-color" style="background:#ffd700"></div> Baseline</div>
 <div class="legend-item"><div class="legend-color" style="background:#58a6ff"></div> DCNv2</div>
 <div class="legend-item"><div class="legend-color" style="background:#a371f7"></div> Transformer</div>
 <div class="legend-item"><div class="legend-color" style="background:#3fb950"></div> MLP</div>
@@ -49,6 +50,7 @@ let data={nodes:[],edges:[],best_score:0};
 let filterImproved=false;
 
 const colors={
+    baseline:'#ffd700',
     dcnv2:'#58a6ff',
     transformer:'#a371f7',
     mlp:'#3fb950',

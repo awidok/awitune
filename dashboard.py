@@ -35,13 +35,24 @@ CORS(app)
 ORCHESTRATOR_LOG_PATH = Path("/tmp/awitune_orchestrator.log")
 
 
+def clean_output(text: str) -> str:
+    """Remove carriage returns and other control characters that break terminal output."""
+    # Remove \r (carriage return) which causes line overwriting
+    text = text.replace('\r', '')
+    # Remove other control characters except newline and tab
+    import re
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text
+
+
 def orchestrator_log(message: str):
     """Log orchestrator activity to file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message = clean_output(message)
     line = f"[{timestamp}] {message}\n"
     with open(ORCHESTRATOR_LOG_PATH, "a") as f:
         f.write(line)
-    print(f"[orchestrator] {message}")
+    print(f"[orchestrator] {message}", flush=True)
 
 
 # ---- Global runtime state ----
@@ -888,6 +899,29 @@ def api_graph():
         if parent and parent in node_map:
             edges.append({
                 "source": parent,
+                "target": node["id"],
+            })
+    
+    # Add baseline as root node if not present
+    baseline_name = "baseline"
+    if baseline_name not in node_map:
+        nodes.insert(0, {
+            "id": baseline_name,
+            "status": "root",
+            "score": None,
+            "improved": False,
+            "group": "baseline",
+            "task_type": "experiment",
+            "created_at": "",
+            "parent": "",
+        })
+        node_map[baseline_name] = nodes[0]
+    
+    # Connect experiments without parent to baseline
+    for node in nodes:
+        if node["id"] != baseline_name and not node.get("parent"):
+            edges.append({
+                "source": baseline_name,
                 "target": node["id"],
             })
     
