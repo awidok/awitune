@@ -690,6 +690,12 @@ def api_state():
     })
 
 
+@app.route("/graph")
+def graph_page():
+    """Experiment graph visualization page."""
+    return render_template("graph.html")
+
+
 @app.route("/api/launch", methods=["POST"])
 def api_launch():
     d = request.get_json() or {}
@@ -827,6 +833,72 @@ def api_events(exp_name):
     except Exception as e:
         events.append({"type": "error", "text": str(e)})
     return jsonify({"events": events[-200:], "raw_lines": raw_lines})
+
+
+@app.route("/api/graph")
+def api_graph():
+    """Get experiment graph data for visualization."""
+    all_exps = db.get_all_experiments(limit=500)
+    
+    nodes = []
+    edges = []
+    node_map = {}
+    
+    # Build nodes
+    for exp in all_exps:
+        name = exp.get("name", "")
+        status = exp.get("status", "unknown")
+        test_score = exp.get("test_score")
+        improved = exp.get("improved", False)
+        parent = exp.get("parent_experiment", "")
+        task_type = exp.get("task_type", "experiment")
+        created_at = exp.get("created_at", "")
+        
+        # Determine node group (solution family)
+        group = "other"
+        if "dcnv2" in name.lower() or "dcn" in name.lower():
+            group = "dcnv2"
+        elif "transformer" in name.lower() or "attention" in name.lower():
+            group = "transformer"
+        elif "tabnet" in name.lower():
+            group = "tabnet"
+        elif "mlp" in name.lower() or "residual" in name.lower():
+            group = "mlp"
+        elif "lgbm" in name.lower() or "lightgbm" in name.lower() or "catboost" in name.lower():
+            group = "tree"
+        elif "analysis" in name.lower() or task_type == "analysis":
+            group = "analysis"
+        
+        node = {
+            "id": name,
+            "status": status,
+            "score": test_score,
+            "improved": improved,
+            "group": group,
+            "task_type": task_type,
+            "created_at": created_at,
+            "parent": parent,
+        }
+        nodes.append(node)
+        node_map[name] = node
+    
+    # Build edges
+    for node in nodes:
+        parent = node.get("parent", "")
+        if parent and parent in node_map:
+            edges.append({
+                "source": parent,
+                "target": node["id"],
+            })
+    
+    # Calculate best score
+    best_score = max((n["score"] for n in nodes if n["score"]), default=0)
+    
+    return jsonify({
+        "nodes": nodes,
+        "edges": edges,
+        "best_score": best_score,
+    })
 
 
 @app.route("/api/files/<exp_name>/<subdir>")
