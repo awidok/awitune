@@ -31,6 +31,19 @@ app = Flask(__name__, template_folder=str(AWITUNE_DIR / "templates"))
 CORS(app)
 
 
+# ---- Orchestrator log ----
+ORCHESTRATOR_LOG_PATH = Path("/tmp/awitune_orchestrator.log")
+
+
+def orchestrator_log(message: str):
+    """Log orchestrator activity to file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+    with open(ORCHESTRATOR_LOG_PATH, "a") as f:
+        f.write(line)
+    print(f"[orchestrator] {message}")
+
+
 # ---- Global runtime state ----
 class RuntimeState:
     def __init__(self):
@@ -542,12 +555,12 @@ def refill_auto_queue():
 
     feeder = _get_idea_feeder()
     if not feeder:
-        print("[refill_auto_queue] No feeder available")
+        orchestrator_log("No feeder available")
         return
     
-    print(f"[refill_auto_queue] Getting ideas (used: {len(used_idea_names)})...")
+    orchestrator_log(f"Getting ideas (used: {len(used_idea_names)})...")
     unused = feeder.get_unused_prompts(used_idea_names)
-    print(f"[refill_auto_queue] Got {len(unused)} idea(s)")
+    orchestrator_log(f"Got {len(unused)} idea(s)")
     if unused:
         idea = unused[0]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -559,6 +572,7 @@ def refill_auto_queue():
         db.create_experiment(eid, prompt=idea["prompt"][:500], base_solution=base_sol,
                              parent_experiment=parent, task_type=idea_task_type)
         db.add_log(eid, f"Auto-queued {idea_task_type}: {idea['name']}")
+        orchestrator_log(f"Queued: {eid} ({idea_task_type}) - {idea.get('reasoning', '')[:100]}")
         item = {"id": eid, "prompt": idea["prompt"], "base_solution": base_sol,
                 "idea_name": idea["name"], "auto": True,
                 "reference_code": idea.get("reference_code"),
@@ -763,6 +777,15 @@ def api_proxy_log():
         c = p.read_text(errors="replace")
         return Response(c[-200_000:] if len(c) > 200_000 else c, mimetype="text/plain")
     return Response("No proxy log", mimetype="text/plain")
+
+
+@app.route("/api/log/orchestrator")
+def api_orchestrator_log():
+    """Get orchestrator/planner log."""
+    if ORCHESTRATOR_LOG_PATH.exists():
+        c = ORCHESTRATOR_LOG_PATH.read_text(errors="replace")
+        return Response(c[-200_000:] if len(c) > 200_000 else c, mimetype="text/plain")
+    return Response("No orchestrator log yet", mimetype="text/plain")
 
 
 @app.route("/api/events/<exp_name>")

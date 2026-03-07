@@ -57,7 +57,8 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 <button class="bt" onclick="tw()" id="wb">Start Worker</button>
 <button class="bt" onclick="tp()" id="pb">Start Proxy</button>
 <button class="bt" onclick="taf()" id="afb">Auto-Feed</button>
-<button class="bt" onclick="showProxyLog()" style="font-size:10px">📋 Proxy Log</button>
+<button class="bt" onclick="showOrchestratorLog()" style="font-size:10px">🧠 Planner</button>
+<button class="bt" onclick="showProxyLog()" style="font-size:10px">📋 Proxy</button>
 <button class="bt" onclick="rf()">↻</button>
 </div></div>
 <div class="lay">
@@ -434,6 +435,18 @@ async function showProxyLog(){
     document.querySelectorAll('.t').forEach(t=>t.classList.remove('a'));
     try{
         const r=await fetch('/api/log/proxy');
+        lc.textContent=await r.text();
+        lc.scrollTop=lc.scrollHeight;
+    }catch(e){lc.textContent='Error: '+e.message}
+}
+
+async function showOrchestratorLog(){
+    viewingFile=true;
+    const lc=document.getElementById('lc');
+    // Deselect all tabs
+    document.querySelectorAll('.t').forEach(t=>t.classList.remove('a'));
+    try{
+        const r=await fetch('/api/log/orchestrator');
         lc.textContent=await r.text();
         lc.scrollTop=lc.scrollHeight;
     }catch(e){lc.textContent='Error: '+e.message}
