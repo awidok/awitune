@@ -48,11 +48,13 @@ def cmd_run(args):
 
     from . import db, idea_feeder, generate_ideas
     from .dashboard import app, init_app, start_proxy, start_worker, rt, recover_orphaned_experiments
+    from .orchestrator_tools import configure as configure_tools
 
     init_app(cfg)
 
     idea_feeder.configure(cfg)
     generate_ideas.configure(cfg)
+    configure_tools(cfg)
 
     if not args.no_proxy:
         print("Auto-starting proxy...")

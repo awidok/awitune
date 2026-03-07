@@ -1,18 +1,15 @@
 """
 LLM-powered meta-agent for generating experiment ideas.
 
-Generic version: the system prompt is task-agnostic.
-Project-specific context (README, evaluation details) comes from config.
+Uses function calling to fetch detailed information on-demand,
+reducing context size from ~70K to ~5K characters.
 
 Usage (via CLI):
     python -m awitune.generate_ideas --project ./my_project --count 3
 """
 
-import argparse
-import difflib
 import json
 import os
-import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +20,7 @@ from dotenv import load_dotenv
 
 from . import db
 from .config import ProjectConfig, load_config
+from .orchestrator_tools import TOOLS, dispatch_tool_call, configure as configure_tools
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -37,14 +35,11 @@ SYSTEM_PROMPT = """\
 You are an ML research lead managing experiment optimization for a machine learning task.
 Your job is to analyze the current state of experiments and decide what to try next.
 
-You receive:
-- The task description
-- A condensed experiment history with metric analysis
-- An automated "what worked / what didn't" summary
-- Source code of the best solution + diffs from other top solutions
-- Reports from recent experiments
-- Analyst reports with data insights (if any)
-- Currently running and queued experiments (to avoid duplication)
+You have access to TOOLS to fetch detailed information on-demand. Use them wisely:
+- First, review the experiment summary table to understand what's been tried
+- Then, use tools to get details about promising or failed experiments
+- Read analyst reports to understand data patterns
+- Check reference code for proven techniques
 
 You can propose TWO types of tasks:
 
@@ -89,40 +84,20 @@ The goal is to build MULTIPLE diverse solutions that can later be stacked. You s
    - If all solutions are neural, propose a tree-based approach
    - If all solutions use same features, propose different feature engineering
 
-4. **Track solution families** — when proposing, consider:
-   - How many solutions exist in each family?
-   - Which families are underexplored?
-   - Which families showed promise but need more work?
-
-For experiments you can:
-1. Start from the best solution and modify it (incremental)
-2. Start from a different solution that showed promise (alternative trajectory)
-3. Create a NEW solution from scratch with different architecture (diversification)
-4. Combine ideas from multiple solutions (cross-pollination)
-
 IMPORTANT RULES:
 - ANALYSIS FIRST: If no recent analyst reports exist, propose analysis before experiments
-- DIVERSIFY: Build a portfolio of DIFFERENT solution families (DCNv2, Transformer, Tree-based, etc.)
-- IMPROVE ALL FAMILIES: Don't just improve the best — make each family competitive
-- PROPOSE ALTERNATIVES: If all solutions are similar, propose a fundamentally different architecture
-- Be specific and actionable — give concrete code changes, not vague suggestions
+- DIVERSIFY: Build a portfolio of DIFFERENT solution families
+- USE TOOLS: Fetch details on-demand instead of guessing
 - Learn from failures — if something was tried and didn't work, don't repeat it
 - NEVER propose something already running or queued
-- NEVER propose a minor variation of a failed approach
 - Focus on approaches that are FUNDAMENTALLY different from what's been tried
-- If the score has plateaued, run analysis to find new directions OR try a different solution family
-- Each experiment must be a single self-contained run.py — train and predict in one script
-- Propose at most 2 analysis tasks per batch
-- NO STACKING/BLENDING: Do NOT propose stacking, blending, or ensemble averaging experiments
-  - The baseline already has an ensemble. Focus on improving individual models.
-  - Stacking/blending will be handled by a separate orchestration tool.
-  - Focus on: architecture improvements, loss functions, feature engineering, regularization, training tricks
+- NO STACKING/BLENDING: Focus on improving individual models
 
 Respond with a JSON array of task objects. Each object must have:
 {
   "name": "snake_case_short_name (max 30 chars)",
-                "type": "object",
-                "properties": {},
+  "task_type": "experiment" or "analysis",
+  "reasoning": "1-3 sentences explaining why this should work",
   "base_experiment": "name of experiment to use as starting workspace, or 'default'",
   "prompt": "Detailed instructions with code changes.",
   "reference_code": null or {
@@ -136,17 +111,23 @@ Return ONLY valid JSON — no markdown fences, no commentary outside the array.
 
 
 def configure(cfg: ProjectConfig):
+    """Configure the idea generator with project config."""
     global _cfg
     _cfg = cfg
+    configure_tools(cfg)
 
 
-def collect_context() -> dict:
+def build_compact_context() -> dict:
+    """Build a compact context with just summaries - agent can fetch details via tools."""
     db.init_db()
 
     readme = ""
     readme_path = _cfg.project_dir / "README.md"
     if readme_path.exists():
         readme = readme_path.read_text(errors="replace")
+        # Truncate to first 2000 chars
+        if len(readme) > 2000:
+            readme = readme[:2000] + "\n... (truncated, full README available in project)"
 
     direction = _cfg.best_score_sort_key()
     all_completed = db.get_all_experiments(limit=200, status="completed")
@@ -156,181 +137,171 @@ def collect_context() -> dict:
     running = db.get_all_experiments(limit=50, status="running")
     queued = db.get_all_experiments(limit=50, status="queued")
 
-    scored = sorted(
-        [e for e in all_completed if e.get("test_score") and e["test_score"] > 0],
-        key=lambda e: e["test_score"],
-        reverse=(_cfg.metric_direction == "maximize"),
-    )
+    # Build compact experiment list (just names and scores)
+    experiments = []
+    scored = []
+    for e in all_completed:
+        exp_info = {
+            "name": e.get("name", ""),
+            "test_score": e.get("test_score"),
+            "val_score": e.get("val_score"),
+            "improved": e.get("improved", False),
+            "status": e.get("status"),
+            "created_at": e.get("created_at", ""),
+        }
+        experiments.append(exp_info)
+        if e.get("test_score"):
+            scored.append(exp_info)
 
-    reports = {}
-    for e in (all_completed[:5] + scored[:5]):
-        name = e["name"]
-        if name in reports:
-            continue
-        output_dir = e.get("output_dir")
-        if not output_dir:
-            continue
-        report_path = Path(output_dir) / "report.md"
-        if report_path.exists():
-            reports[name] = report_path.read_text(errors="replace")
-
-    code_snippets = {}
-    for exp in scored[:5]:
-        ws_dir = exp.get("workspace_dir")
-        if not ws_dir:
-            continue
-        run_py = Path(ws_dir) / "run.py"
-        if run_py.exists():
-            code_snippets[exp["name"]] = {
-                "code": run_py.read_text(errors="replace"),
-                "score": exp["test_score"],
-            }
-    if not code_snippets:
-        baseline_run = _cfg.solutions_dir / "baseline" / "run.py"
-        if baseline_run.exists():
-            code_snippets["baseline (default)"] = {
-                "code": baseline_run.read_text(errors="replace"),
-                "score": best_score,
-            }
+    # Sort by score
+    if _cfg.metric_direction == "maximize":
+        scored.sort(key=lambda x: x.get("test_score", 0), reverse=True)
+    else:
+        scored.sort(key=lambda x: x.get("test_score", float("inf")))
 
     return {
         "readme": readme,
-        "experiments": all_completed,
-        "scored": scored,
         "best_score": best_score,
-        "best_experiment": best_exp,
-        "running": running,
-        "queued": queued,
-        "reports": reports,
-        "code_snippets": code_snippets,
+        "best_experiment": best_exp.get("name") if best_exp else None,
+        "running": [{"name": e.get("name"), "prompt": (e.get("prompt") or "")[:100]} for e in running],
+        "queued": [{"name": e.get("name"), "prompt": (e.get("prompt") or "")[:100]} for e in queued],
+        "experiments": experiments[-50:],  # Last 50 experiments
+        "top_experiments": [e["name"] for e in scored[:5]],  # Top 5 names
     }
 
 
-def _build_analysis_summary(scored: list) -> str:
-    if len(scored) < 2:
-        return ""
-    lines = ["## Analysis: What Worked and What Didn't\n"]
-    improved = [e for e in scored if e.get("improved")]
-    not_improved = [e for e in scored if not e.get("improved")]
-    if improved:
-        lines.append("### Approaches that IMPROVED the score:")
-        for e in improved[:10]:
-            prompt_short = (e.get("prompt") or "")[:80].replace("\n", " ")
-            lines.append(f"- **{e['name']}** ({e['test_score']:.6f}): {prompt_short}")
-        lines.append("")
-    if not_improved:
-        lines.append("### Approaches that DID NOT improve:")
-        for e in not_improved[:15]:
-            prompt_short = (e.get("prompt") or "")[:80].replace("\n", " ")
-            lines.append(f"- **{e['name']}** ({e.get('test_score', 'N/A')}): {prompt_short}")
-        lines.append("")
-    if len(scored) >= 3:
-        lines.append("### Score progression (chronological):")
-        by_time = sorted(scored, key=lambda e: e.get("created_at", ""))
-        for e in by_time[-15:]:
-            imp = " ★" if e.get("improved") else ""
-            lines.append(f"  {e['test_score']:.6f}{imp}  {e['name']}")
-        lines.append("")
-    return "\n".join(lines)
-
-
-def _build_code_section(code_snippets: dict) -> str:
-    if not code_snippets:
-        return ""
-    parts = ["## Source Code\n"]
-    names = list(code_snippets.keys())
-    best_name = names[0]
-    best_info = code_snippets[best_name]
-    parts.append(f"### Best solution: {best_name} (score: {best_info['score']:.6f})\n")
-    parts.append(f"```python\n{best_info['code']}\n```\n")
-    if len(names) > 1:
-        best_lines = best_info["code"].splitlines(keepends=True)
-        for other_name in names[1:]:
-            other_info = code_snippets[other_name]
-            other_lines = other_info["code"].splitlines(keepends=True)
-            diff = list(difflib.unified_diff(best_lines, other_lines,
-                                              fromfile=f"{best_name}/run.py",
-                                              tofile=f"{other_name}/run.py", n=3))
-            if diff:
-                diff_text = "".join(diff)
-                if len(diff_text) > 5000:
-                    diff_text = diff_text[:5000] + "\n... (diff truncated) ...\n"
-                parts.append(f"### Diff: {other_name} (score: {other_info['score']:.6f}) vs best\n")
-                parts.append(f"```diff\n{diff_text}```\n")
-    return "\n".join(parts)
-
-
 def build_user_prompt(ctx: dict, count: int) -> str:
+    """Build a compact user prompt - agent can fetch details via tools."""
     parts = []
+    
+    # Task description (truncated)
     parts.append("## Task Description\n")
-    parts.append(ctx["readme"] if ctx["readme"] else "No task description available.")
+    parts.append(ctx["readme"])
     parts.append("")
+    
+    # Current state
     parts.append(f"## Current Best Score: {ctx['best_score']:.6f}")
+    if ctx.get("best_experiment"):
+        parts.append(f"Best experiment: {ctx['best_experiment']}")
     parts.append(f"## Metric: {_cfg.test_metric_key} ({_cfg.metric_direction})\n")
 
+    # Running/queued (to avoid duplication)
     running = ctx.get("running", [])
     queued = ctx.get("queued", [])
     if running or queued:
         parts.append("## Currently In Progress (DO NOT duplicate)\n")
         for e in running:
-            parts.append(f"- [running] {e['name']}: {(e.get('prompt') or '')[:100]}")
+            parts.append(f"- [running] {e['name']}: {e['prompt']}")
         for e in queued:
-            parts.append(f"- [queued] {e['name']}: {(e.get('prompt') or '')[:100]}")
+            parts.append(f"- [queued] {e['name']}: {e['prompt']}")
         parts.append("")
 
+    # Compact experiment table
     experiments = ctx["experiments"]
     if experiments:
-        parts.append("## Experiment History\n")
-        parts.append("| # | Name | Score | Improved? | Approach |")
-        parts.append("|---|------|-------|-----------|----------|")
-        for i, exp in enumerate(experiments):
+        parts.append("## Experiment Summary\n")
+        parts.append("Use `get_experiment_summary(name)` for details, `get_experiment_code(name)` for code.\n")
+        parts.append("| Name | Score | Improved? |")
+        parts.append("|------|-------|-----------|")
+        for exp in experiments[-30:]:  # Last 30
             score = f"{exp['test_score']:.6f}" if exp.get("test_score") else "N/A"
-            imp = "YES" if exp.get("improved") else "no"
-            prompt_short = (exp.get("prompt") or "")[:80].replace("|", "/").replace("\n", " ")
-            parts.append(f"| {i+1} | {exp['name']} | {score} | {imp} | {prompt_short} |")
+            imp = "★" if exp.get("improved") else ""
+            parts.append(f"| {exp['name']} | {score} | {imp} |")
         parts.append("")
 
-    analysis = _build_analysis_summary(ctx["scored"])
-    if analysis:
-        parts.append(analysis)
+    # Top experiments hint
+    if ctx.get("top_experiments"):
+        parts.append("## Top Experiments (fetch code with get_experiment_code)\n")
+        for name in ctx["top_experiments"]:
+            parts.append(f"- {name}")
+        parts.append("")
 
-    code_section = _build_code_section(ctx["code_snippets"])
-    if code_section:
-        parts.append(code_section)
+    # Tool usage hint
+    parts.append("## Available Tools\n")
+    parts.append("- `get_experiment_summary(name)` — brief info about an experiment\n")
+    parts.append("- `get_experiment_code(name)` — full source code\n")
+    parts.append("- `get_experiment_report(name)` — training report with observations\n")
+    parts.append("- `get_best_solution_code()` — code of the best solution\n")
+    parts.append("- `get_reference_code(filename)` — reference solutions (winner code)\n")
+    parts.append("- `list_analyst_reports()` — available data analysis reports\n")
+    parts.append("- `get_analyst_report(name)` — specific analysis report\n")
+    parts.append("")
 
-    if ctx["reports"]:
-        parts.append("## Experiment Reports\n")
-        for name, report in list(ctx["reports"].items())[:5]:
-            if len(report) > 3000:
-                report = report[:3000] + "\n... (truncated) ...\n"
-            parts.append(f"### {name}\n{report}\n")
-
-    parts.append(f"\n## Your Task\nPropose {count} task(s). Return JSON array with {count} object(s).\n"
-                 f"Check 'Currently In Progress' — do NOT duplicate those.")
+    parts.append(f"## Your Task\nPropose {count} task(s). Return JSON array with {count} object(s).")
     return "\n".join(parts)
 
 
-def call_openai_api(system: str, user: str, temperature: float = 0.7) -> str:
+def call_openai_with_tools(system: str, user: str, temperature: float = 0.7) -> str:
+    """Call OpenAI API with function calling support."""
     url = f"{OPENAI_API_BASE}/chat/completions"
-    payload = {
-        "model": "default",
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": 8000,
-        "temperature": temperature,
-    }
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers, timeout=300, verify=False)
-    response.raise_for_status()
-    data = response.json()
-    choice = data.get("choices", [{}])[0]
-    message = choice.get("message", {})
-    return message.get("content", "") or message.get("reasoning_content", "")
+    
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    
+    max_iterations = 10
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        
+        payload = {
+            "model": "default",
+            "messages": messages,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "max_tokens": 8000,
+            "temperature": temperature,
+        }
+        
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers, timeout=300, verify=False)
+        response.raise_for_status()
+        data = response.json()
+        
+        choice = data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        
+        # Check if model wants to call tools
+        tool_calls = message.get("tool_calls", [])
+        
+        if not tool_calls:
+            # No more tool calls, return the final response
+            content = message.get("content", "") or message.get("reasoning_content", "")
+            return content
+        
+        # Process tool calls
+        messages.append(message)
+        
+        for tool_call in tool_calls:
+            tool_id = tool_call.get("id", "")
+            function = tool_call.get("function", {})
+            tool_name = function.get("name", "")
+            
+            try:
+                arguments = json.loads(function.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                arguments = {}
+            
+            print(f"  Tool call: {tool_name}({arguments})")
+            
+            # Dispatch tool call
+            result = dispatch_tool_call(tool_name, arguments)
+            
+            # Add tool result to messages
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "name": tool_name,
+                "content": json.dumps(result, ensure_ascii=False)[:10000],  # Limit response size
+            })
+    
+    return ""
 
 
 def parse_ideas(response_text: str) -> list[dict]:
+    """Parse ideas from LLM response."""
     text = response_text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -359,13 +330,14 @@ def parse_ideas(response_text: str) -> list[dict]:
 
 
 def generate_ideas(count: int = 1) -> list[dict]:
-    """Generate experiment ideas via LLM and return them (no caching)."""
-    print(f"Generating {count} experiment idea(s) via LLM...")
-    ctx = collect_context()
+    """Generate experiment ideas via LLM with tool calling."""
+    print(f"Generating {count} experiment idea(s) via LLM (with tools)...")
+    ctx = build_compact_context()
     user_prompt = build_user_prompt(ctx, count)
-    print(f"  Context: {len(ctx['experiments'])} completed, prompt: {len(user_prompt)} chars")
+    print(f"  Context: {len(ctx['experiments'])} experiments, prompt: {len(user_prompt)} chars")
+    
     try:
-        response_text = call_openai_api(SYSTEM_PROMPT, user_prompt)
+        response_text = call_openai_with_tools(SYSTEM_PROMPT, user_prompt)
         print(f"  LLM response: {len(response_text)} chars")
         if not response_text:
             print("  WARNING: Empty response from LLM")
@@ -377,3 +349,16 @@ def generate_ideas(count: int = 1) -> list[dict]:
         print(f"  ERROR in generate_ideas: {e}")
         traceback.print_exc()
         return []
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", required=True, help="Path to project directory")
+    parser.add_argument("--count", type=int, default=3, help="Number of ideas to generate")
+    args = parser.parse_args()
+
+    cfg = load_config(args.project)
+    configure(cfg)
+    
+    ideas = generate_ideas(args.count)
+    print(json.dumps(ideas, indent=2, ensure_ascii=False))
