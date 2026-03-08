@@ -14,8 +14,8 @@ from flask_cors import CORS
 
 from .. import db
 from ..config import ProjectConfig
-from ..dashboard_proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
-from ..dashboard_runtime import (
+from .proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
+from .runtime import (
     MAX_AUTO_QUEUE_SIZE,
     ORCHESTRATOR_LOG_PATH,
     RuntimeState,
@@ -31,18 +31,18 @@ from ..orchestrator.management import (
     read_tasks as orch_read_tasks,
     restart_experiment as orch_restart_experiment,
 )
-from ..orchestrator_eval import (
+from ..orchestrator.eval import (
     extract_metrics as eval_extract_metrics,
     has_result_event as eval_has_result_event,
     read_eval_results as eval_read_results,
     run_evaluate as eval_run_evaluate,
 )
-from ..orchestrator_queue import (
+from ..orchestrator.queue import (
     collect_used_idea_names as queue_collect_used_idea_names,
     queue_idea as queue_queue_idea,
 )
-from ..orchestrator_service import OrchestratorService
-from ..orchestrator_workspace import (
+from ..orchestrator.service import OrchestratorService
+from ..orchestrator.workspace import (
     analyst_reports_dir as ws_analyst_reports_dir,
     build_reference_code_section as ws_build_reference_code_section,
     copy_analyst_reports_to_workspace as ws_copy_analyst_reports_to_workspace,

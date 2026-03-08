@@ -6,7 +6,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from . import db
+from .. import db
 
 
 def resolve_base_solution(cfg, base_experiment: str) -> str:

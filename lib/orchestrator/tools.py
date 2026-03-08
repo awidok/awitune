@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from . import db
-    from .config import ProjectConfig
+    from .. import db
+    from ..config import ProjectConfig
 except ImportError:
     # Allow running as script
     import db

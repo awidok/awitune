@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from . import db
 from .config import ProjectConfig, load_config
-from .orchestrator_tools import TOOLS, dispatch_tool_call, configure as configure_tools
+from .orchestrator.tools import TOOLS, dispatch_tool_call, configure as configure_tools
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()

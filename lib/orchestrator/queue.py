@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from . import db
+from .. import db
 
 
 def collect_used_idea_names(rt) -> set:

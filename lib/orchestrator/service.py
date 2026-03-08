@@ -10,13 +10,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import db
-from .dashboard_runtime import MAX_AUTO_QUEUE_SIZE
-from .orchestrator_eval import extract_metrics, has_result_event, read_eval_results, run_evaluate
-from .orchestrator_queue import collect_used_idea_names, queue_idea
-from .orchestrator_workspace import analyst_reports_dir, prepare_analyst_workspace, prepare_workspace, resolve_base_solution
-from .notifications import send_telegram_notification
-from .dashboard_proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
+from .. import db
+from ..dashboard.runtime import MAX_AUTO_QUEUE_SIZE
+from ..dashboard.proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
+from ..notifications import send_telegram_notification
+from .eval import extract_metrics, has_result_event, read_eval_results, run_evaluate
+from .queue import collect_used_idea_names, queue_idea
+from .workspace import analyst_reports_dir, prepare_analyst_workspace, prepare_workspace, resolve_base_solution
 
 
 class OrchestratorService:
@@ -279,7 +279,7 @@ class OrchestratorService:
 
     def _get_idea_feeder(self):
         try:
-            from . import idea_feeder
+            from .. import idea_feeder
             return idea_feeder
         except ImportError:
             return None

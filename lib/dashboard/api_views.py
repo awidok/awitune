@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .. import db
-from ..orchestrator_workspace import analyst_reports_dir
+from ..orchestrator.workspace import analyst_reports_dir
 
 
 def build_state_payload(rt):
