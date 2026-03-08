@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -1240,10 +1240,10 @@ def api_tasks(exp_name):
         try:
             tasks_dir = _find_claude_tasks_dir(cn)
             if tasks_dir:
-                # Get list of .output files first
-                r = subprocess.run(DOCKER_CMD + ["exec", cn, "sh", "-c",
-                                   f"for f in {tasks_dir}/*.output; do stat -c '%n|%s|%Y' \"$f\"; done"],
-                                   capture_output=True, text=True, timeout=10)
+                # Get list of .output files with size and modification time
+                cmd = DOCKER_CMD + ["exec", cn, "sh", "-c",
+                                   f"for f in {tasks_dir}/*.output; do stat -c '%n|%s|%Y' \"$f\"; done"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
                 if r.returncode == 0:
                     for line in r.stdout.strip().split("\n"):
                         line = line.strip()
@@ -1258,7 +1258,6 @@ def api_tasks(exp_name):
                                 timestamp = int(parts[2])
                                 # Convert to local time (Moscow UTC+3)
                                 utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                                # Moscow timezone is UTC+3
                                 moscow_tz = timezone(timedelta(hours=3))
                                 local_dt = utc_dt.astimezone(moscow_tz)
                                 modified = local_dt.strftime("%b %d %H:%M")
