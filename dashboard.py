@@ -217,7 +217,7 @@ def start_proxy():
     env["PROXY_HOST"] = PROXY_HOST
     env["PROXY_PORT"] = str(rt.cfg.proxy_port)
     rt.proxy_proc = subprocess.Popen(
-        [py, str(AWITUNE_DIR / "proxy.py")], cwd=str(AWITUNE_DIR), env=env,
+        [py, str(AWITUNE_DIR / "lib" / "proxy.py")], cwd=str(AWITUNE_DIR), env=env,
         stdout=open("/tmp/awitune_proxy.log", "a"), stderr=subprocess.STDOUT,
         start_new_session=True)  # Detach from terminal to prevent signal propagation
     time.sleep(2)
