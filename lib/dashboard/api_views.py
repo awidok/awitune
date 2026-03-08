@@ -12,7 +12,8 @@ from ..orchestrator.workspace import analyst_reports_dir
 def build_state_payload(rt):
     direction = rt.cfg.best_score_sort_key()
     stats = db.get_stats(direction)
-    exps = db.get_all_experiments(limit=2000)
+    # Keep /api/state fast: this endpoint is polled frequently by the UI.
+    exps = db.get_dashboard_experiments(limit=500)
 
     def _exp_sort_key(e):
         status = e.get("status", "")
@@ -96,6 +97,10 @@ def build_graph_payload():
             group = "tree"
         elif "analysis" in name.lower() or task_type == "analysis":
             group = "analysis"
+        elif task_type == "oof_fold":
+            group = "oof_fold"
+        elif "stack" in name.lower() or "blend" in name.lower() or task_type == "stacking":
+            group = "stacking"
 
         node = {
             "id": name,

@@ -18,6 +18,13 @@ from .eval import extract_metrics, has_result_event, read_eval_results, run_eval
 from .queue import collect_used_idea_names, queue_idea
 from .workspace import analyst_reports_dir, prepare_analyst_workspace, prepare_workspace, resolve_base_solution
 
+OOF_FILE_PATTERNS = (
+    "oof_predictions.parquet",
+    "oof_predictions.csv",
+    "oof_preds.parquet",
+    "oof_preds.csv",
+)
+
 
 class OrchestratorService:
     def __init__(self, rt, docker_cmd, awitune_dir: Path, proxy_host: str, openai_api_key: str, orchestrator_log):
@@ -135,11 +142,25 @@ class OrchestratorService:
         except Exception as exc:
             db.add_log(exp_name, f"Container kill after result failed: {exc}", level="warning")
 
-    def run_agent_in_thread(self, exp_name, prompt, base_solution, gpu_id, reference_code=None, task_type="experiment"):
+    def run_agent_in_thread(
+        self,
+        exp_name,
+        prompt,
+        base_solution,
+        gpu_id,
+        reference_code=None,
+        task_type="experiment",
+        task_payload=None,
+    ):
+        if task_type == "oof_fold":
+            self._run_oof_fold_in_thread(exp_name, gpu_id, task_payload or {})
+            return
+
         cfg = self.rt.cfg
         exp_dir = cfg.experiments_dir / exp_name
         exp_dir.mkdir(parents=True, exist_ok=True)
         is_analysis = task_type == "analysis"
+        is_stacking = task_type == "stacking"
 
         db.update_experiment(exp_name, status="running", gpu_id=gpu_id, started_at=datetime.now().isoformat(), exp_dir=str(exp_dir))
         db.add_log(exp_name, f"Starting {'analysis' if is_analysis else 'experiment'} on GPU {gpu_id}")
@@ -155,11 +176,17 @@ class OrchestratorService:
             if is_analysis:
                 ws = prepare_analyst_workspace(cfg, exp_dir, prompt)
             else:
+                effective_prompt = prompt
+                if is_stacking:
+                    effective_prompt = self._build_stacking_prompt(
+                        prompt,
+                        stack_sources=(task_payload or {}).get("stack_sources") or [],
+                    )
                 ws = prepare_workspace(
                     cfg,
                     base_solution or str(cfg.solutions_dir / "baseline"),
                     exp_dir,
-                    prompt,
+                    effective_prompt,
                     best_score,
                     prev_exps,
                     reference_code=reference_code,
@@ -265,7 +292,7 @@ class OrchestratorService:
             if is_analysis:
                 self._finalize_analysis(exp_name, exp_dir, out, elapsed, ec)
             else:
-                self._finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp)
+                self._finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp, task_type=task_type)
         except Exception as e:
             db.update_experiment(
                 exp_name,
@@ -310,10 +337,11 @@ class OrchestratorService:
             notes="analysis complete" if has_report else "analysis finished (no report)",
         )
 
-    def _finalize_experiment_run(self, exp_name, exp_dir, out, elapsed, ec, best_score, lp):
+    def _finalize_experiment_run(self, exp_name, exp_dir, out, elapsed, ec, best_score, lp, task_type="experiment"):
         run_evaluate(self.rt.cfg, out, lp)
         ev = read_eval_results(out)
         test, val = extract_metrics(self.rt.cfg, ev)
+        self._register_oof_predictions(exp_name, out, test)
 
         improved = False
         notes = "no improvement"
@@ -363,6 +391,571 @@ class OrchestratorService:
         except ImportError:
             return None
 
+    @staticmethod
+    def _infer_family(idea_or_exp: dict) -> str:
+        task_type = str(idea_or_exp.get("task_type") or "").lower()
+        if task_type == "analysis":
+            return "analysis"
+        if task_type == "oof_fold":
+            return "oof_fold"
+        if task_type == "stacking":
+            return "stacking"
+        text = " ".join(
+            [
+                str(idea_or_exp.get("name") or ""),
+                str(idea_or_exp.get("idea_name") or ""),
+                str(idea_or_exp.get("prompt") or ""),
+                str(idea_or_exp.get("notes") or ""),
+                str(idea_or_exp.get("base_experiment") or ""),
+            ]
+        ).lower()
+        if any(k in text for k in ("stack", "blend", "blending", "meta-model", "ensemble", "oof")):
+            return "stacking"
+        if any(k in text for k in ("lightgbm", "lgbm", "xgboost", "catboost", "gbdt", "tree")):
+            return "tree"
+        if any(k in text for k in ("transformer", "attention", "tabtransformer", "fttransformer")):
+            return "transformer"
+        if any(k in text for k in ("dcnv2", "dcn", "crossnet")):
+            return "dcnv2"
+        if "tabnet" in text:
+            return "tabnet"
+        if any(k in text for k in ("mlp", "residual", "feedforward", "dense")):
+            return "mlp"
+        if any(k in text for k in ("linear", "ridge", "lasso", "logistic")):
+            return "linear"
+        return "other"
+
+    @staticmethod
+    def _is_stacking_item(idea_or_exp: dict) -> bool:
+        return OrchestratorService._infer_family(idea_or_exp) == "stacking"
+
+    def _select_diverse_ideas(self, ideas: list[dict], limit: int) -> list[dict]:
+        if limit <= 0:
+            return []
+        by_family = {}
+        for idx, idea in enumerate(ideas):
+            family = self._infer_family(idea)
+            by_family.setdefault(family, []).append((idx, idea))
+
+        selected = []
+        seen = set()
+        for family, group in by_family.items():
+            if family in seen:
+                continue
+            selected.append(group[0][1])
+            seen.add(family)
+            if len(selected) >= limit:
+                return selected
+
+        for idea in ideas:
+            if len(selected) >= limit:
+                break
+            if idea not in selected:
+                selected.append(idea)
+        return selected
+
+    def _count_stacking_mix(self) -> tuple[int, int]:
+        running = db.get_all_experiments(limit=500, status="running")
+        running_total = len(running)
+        running_stacking = sum(1 for exp in running if self._is_stacking_item(exp))
+        with self.rt.lock:
+            queued_items = list(self.rt.manual_queue) + list(self.rt.auto_queue)
+        queued_total = len(queued_items)
+        queued_stacking = sum(1 for item in queued_items if self._is_stacking_item(item))
+        return running_total + queued_total, running_stacking + queued_stacking
+
+    def _filter_and_prioritize_auto_ideas(self, ideas: list[dict], needed: int) -> list[dict]:
+        if needed <= 0 or not ideas:
+            return []
+
+        diverse = self._select_diverse_ideas(ideas, len(ideas))
+        if not self.rt.cfg.enable_stacking_mode:
+            return diverse[:needed]
+
+        base_candidates = [i for i in diverse if not self._is_stacking_item(i)]
+        stacking_candidates = [i for i in diverse if self._is_stacking_item(i)]
+        current_total, current_stacking = self._count_stacking_mix()
+        max_stack_share = max(0.0, min(1.0, float(self.rt.cfg.stacking_max_queue_share)))
+        min_base_share = max(0.0, min(1.0, float(self.rt.cfg.stacking_min_base_share)))
+
+        selected = []
+        min_base_count = int(round(needed * min_base_share))
+        min_base_count = min(needed, max(1, min_base_count)) if needed > 1 else needed
+
+        for idea in base_candidates:
+            if len(selected) >= min_base_count:
+                break
+            selected.append(idea)
+
+        for idea in stacking_candidates:
+            if len(selected) >= needed:
+                break
+            simulated_total = current_total + len(selected) + 1
+            simulated_stacking = current_stacking + sum(1 for s in selected if self._is_stacking_item(s)) + 1
+            if simulated_total <= 0:
+                continue
+            stack_share = simulated_stacking / simulated_total
+            base_share = (simulated_total - simulated_stacking) / simulated_total
+            if stack_share <= max_stack_share and base_share >= min_base_share:
+                selected.append(idea)
+            else:
+                self.orchestrator_log(
+                    f"Skip stacking idea due to quota: stack_share={stack_share:.2f}, base_share={base_share:.2f}"
+                )
+
+        for idea in base_candidates:
+            if len(selected) >= needed:
+                break
+            if idea not in selected:
+                selected.append(idea)
+
+        return selected[:needed]
+
+    def _oof_registry_path(self) -> Path:
+        return self.rt.cfg.data_dir / "stacking_oof_registry.json"
+
+    def _load_oof_registry(self) -> list[dict]:
+        fp = self._oof_registry_path()
+        if not fp.exists():
+            return []
+        try:
+            data = json.loads(fp.read_text(errors="replace"))
+            if isinstance(data, list):
+                return [row for row in data if isinstance(row, dict)]
+        except Exception:
+            return []
+        return []
+
+    def _save_oof_registry(self, rows: list[dict]):
+        fp = self._oof_registry_path()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+
+    def _register_oof_predictions(self, exp_name: str, output_dir: Path, test_score):
+        found = []
+        for pattern in OOF_FILE_PATTERNS:
+            for match in output_dir.glob(pattern):
+                if match.is_file():
+                    found.append(match)
+        if not found:
+            return
+
+        rows = self._load_oof_registry()
+        rows = [row for row in rows if Path(row.get("path", "")).exists()]
+        existing = {(row.get("experiment"), row.get("path")) for row in rows}
+
+        for fp in found:
+            exp = db.get_experiment(exp_name) or {}
+            row = {
+                "experiment": exp_name,
+                "path": str(fp.resolve()),
+                "score": test_score,
+                "updated_at": datetime.now().isoformat(),
+                "splitter": self.rt.cfg.stacking_oof_splitter,
+                "folds": int(self.rt.cfg.stacking_oof_folds),
+                "family": self._infer_family({"name": exp_name, "task_type": exp.get("task_type", "")}),
+            }
+            key = (row["experiment"], row["path"])
+            if key not in existing:
+                rows.append(row)
+                existing.add(key)
+
+        rows.sort(
+            key=lambda r: (
+                r.get("score") is None,
+                -(float(r.get("score")) if isinstance(r.get("score"), (int, float)) else -1e9),
+            )
+        )
+        self._save_oof_registry(rows)
+        db.set_global("stacking_oof_registry", rows)
+        db.add_log(exp_name, f"Registered {len(found)} OOF file(s) for stacking reuse")
+
+    def _build_stacking_prompt(self, user_prompt: str, stack_sources: list[str] | None = None) -> str:
+        rows = self._load_oof_registry()
+        available = [r for r in rows if Path(r.get("path", "")).exists()]
+        available.sort(
+            key=lambda r: (
+                r.get("score") is None,
+                -(float(r.get("score")) if isinstance(r.get("score"), (int, float)) else -1e9),
+            )
+        )
+        if stack_sources:
+            src = {str(x).strip() for x in stack_sources if str(x).strip()}
+            available = [r for r in available if str(r.get("experiment") or "") in src]
+        top_rows = available[:20]
+
+        registry_lines = []
+        for row in top_rows:
+            score = row.get("score")
+            score_str = f"{score:.6f}" if isinstance(score, (float, int)) else "N/A"
+            registry_lines.append(
+                f"- {row.get('experiment')} | score={score_str} | family={row.get('family','other')} | {row.get('path')}"
+            )
+
+        oof_block = "\n".join(registry_lines) if registry_lines else "- no registered OOF files yet"
+        stacking_guidance = (
+            "## STACKING MODE (orchestrator override)\n"
+            "This run is explicitly for stacking/blending. You may ignore generic 'NO stacking' rules.\n"
+            f"Use {self.rt.cfg.stacking_oof_splitter} with {self.rt.cfg.stacking_oof_folds} folds for any new OOF generation.\n"
+            "Reuse OOF predictions from previous experiments whenever possible.\n"
+            "Prioritize blending diverse families (tree/transformer/dcn/mlp), not variants of one family.\n"
+            "Save OOF table to `/app/output/oof_predictions.parquet` (customer_id + predict_* columns).\n"
+            "Save blender report in `/app/output/report.md` including which OOF sources were used.\n\n"
+            "### Registered OOF predictions\n"
+            f"{oof_block}\n"
+        )
+        if user_prompt:
+            return f"{stacking_guidance}\n\n## Stacking task details\n{user_prompt}"
+        return stacking_guidance
+
+    def _extract_stacking_sources(self, item: dict) -> list[str]:
+        direct = item.get("stack_sources")
+        if isinstance(direct, list):
+            sources = [str(x).strip() for x in direct if str(x).strip()]
+            if sources:
+                return sources
+
+        base_experiment = str(item.get("base_experiment") or "").strip()
+        if "," in base_experiment:
+            sources = [x.strip() for x in base_experiment.split(",") if x.strip()]
+            if sources:
+                return sources
+
+        prompt = str(item.get("prompt") or "")
+        if not prompt:
+            return []
+        all_names = {e.get("name", "") for e in db.get_all_experiments(limit=2000)}
+        detected = [name for name in all_names if name and name in prompt]
+        return sorted(set(detected))
+
+    def _has_ready_oof_for_experiment(self, exp_name: str) -> bool:
+        rows = self._load_oof_registry()
+        for row in rows:
+            if str(row.get("experiment") or "") != exp_name:
+                continue
+            if Path(str(row.get("path") or "")).exists():
+                return True
+        return False
+
+    def _build_oof_runner_script(self) -> str:
+        return """import argparse
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+
+
+def get_splitter(y, n_splits: int):
+    try:
+        from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+
+        splitter = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        return splitter.split(np.zeros((len(y), 1)), y)
+    except Exception:
+        from sklearn.model_selection import KFold
+
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        return splitter.split(np.arange(len(y)))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workspace", required=True)
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--fold-idx", type=int, required=True)
+    parser.add_argument("--n-folds", type=int, required=True)
+    args = parser.parse_args()
+
+    workspace = Path(args.workspace)
+    data_dir = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = data_dir / "local_train.parquet"
+    df = pl.read_parquet(str(train_path))
+    target_cols = [c for c in df.columns if c.startswith("target_")]
+    if not target_cols:
+        raise RuntimeError("No target_* columns found in local_train.parquet")
+
+    y = df.select(target_cols).to_numpy()
+    splits = list(get_splitter(y, args.n_folds))
+    if args.fold_idx < 0 or args.fold_idx >= len(splits):
+        raise RuntimeError(f"Invalid fold index {args.fold_idx} for {len(splits)} splits")
+
+    train_idx, val_idx = splits[args.fold_idx]
+    fold_data_dir = output_dir / "fold_data"
+    fold_data_dir.mkdir(parents=True, exist_ok=True)
+    train_prefix = fold_data_dir / "train"
+    val_prefix = fold_data_dir / "val"
+
+    df[train_idx].write_parquet(str(train_prefix) + ".parquet")
+    df[val_idx].write_parquet(str(val_prefix) + ".parquet")
+    for metadata_file in data_dir.glob("*.json"):
+        target_meta = fold_data_dir / metadata_file.name
+        target_meta.write_bytes(metadata_file.read_bytes())
+
+    run_output = output_dir / "run_output"
+    run_output.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "python",
+        str(workspace / "run.py"),
+        "--train",
+        str(train_prefix),
+        "--val",
+        str(val_prefix),
+        "--test",
+        str(data_dir / "local_test"),
+        "--submit",
+        str(data_dir / "contest_test"),
+        str(run_output),
+    ]
+    subprocess.run(cmd, check=True)
+
+    val_pred = run_output / "val_predictions.parquet"
+    if not val_pred.exists():
+        raise RuntimeError("run.py did not produce val_predictions.parquet")
+    (output_dir / "oof_fold_predictions.parquet").write_bytes(val_pred.read_bytes())
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+    def _enqueue_external_oof_folds_for_source(self, parent_exp_name: str, requester: str = ""):
+        parent = db.get_experiment(parent_exp_name) or {}
+        if not parent.get("workspace_dir"):
+            if requester:
+                db.add_log(requester, f"Cannot queue OOF for {parent_exp_name}: missing workspace", level="warning")
+            return
+        existing = db.get_all_experiments(limit=3000)
+        existing_for_parent_active = [
+            e for e in existing if e.get("task_type") == "oof_fold" and e.get("parent_experiment") == parent_exp_name
+            and e.get("status") in ("queued", "running")
+        ]
+        if existing_for_parent_active:
+            return
+
+        parent_dir = self.rt.cfg.experiments_dir / parent_exp_name
+        oof_runner_path = parent_dir / "oof_runner.py"
+        oof_runner_path.write_text(self._build_oof_runner_script())
+
+        n_folds = int(self.rt.cfg.stacking_oof_folds)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        for fold_idx in range(n_folds):
+            eid = f"oof_{parent_exp_name}_f{fold_idx}_{ts}"
+            db.create_experiment(
+                eid,
+                prompt=f"External OOF fold {fold_idx}/{n_folds - 1} for {parent_exp_name}",
+                base_solution=str(parent.get("workspace_dir", "")),
+                parent_experiment=parent_exp_name,
+                task_type="oof_fold",
+            )
+            db.add_log(
+                eid,
+                f"Queued external OOF fold {fold_idx + 1}/{n_folds} for {parent_exp_name}"
+                + (f" (requested by {requester})" if requester else ""),
+            )
+            item = {
+                "id": eid,
+                "prompt": "",
+                "base_solution": str(parent.get("workspace_dir", "")),
+                "task_type": "oof_fold",
+                "auto": True,
+                "parent_experiment": parent_exp_name,
+                "fold_idx": fold_idx,
+                "n_folds": n_folds,
+                "oof_runner_path": str(oof_runner_path),
+            }
+            with self.rt.lock:
+                self.rt.auto_queue.append(item)
+        self.orchestrator_log(f"Queued {n_folds} external OOF fold task(s) for {parent_exp_name}")
+
+    def _ensure_stacking_dependencies(self, item: dict) -> bool:
+        if item.get("task_type") != "stacking":
+            return True
+        sources = self._extract_stacking_sources(item)
+        if not sources:
+            db.add_log(item["id"], "Stacking has no explicit sources; running without OOF dependencies", level="warning")
+            return True
+        item["stack_sources"] = sources
+
+        missing = []
+        for source_exp in sources:
+            if self._has_ready_oof_for_experiment(source_exp):
+                continue
+            missing.append(source_exp)
+            self._enqueue_external_oof_folds_for_source(source_exp, requester=item["id"])
+
+        if missing:
+            db.add_log(
+                item["id"],
+                f"Waiting for OOF dependencies: {', '.join(missing)}",
+            )
+            return False
+        return True
+
+    def _aggregate_parent_oof(self, parent_exp_name: str):
+        try:
+            import polars as pl
+        except Exception:
+            return
+
+        all_exps = db.get_all_experiments(limit=5000)
+        fold_exps = [
+            e
+            for e in all_exps
+            if e.get("task_type") == "oof_fold"
+            and e.get("parent_experiment") == parent_exp_name
+            and e.get("status") == "completed"
+        ]
+        n_folds = int(self.rt.cfg.stacking_oof_folds)
+        if len(fold_exps) < n_folds:
+            return
+
+        parts = []
+        fold_cv_scores = []
+        for e in fold_exps:
+            fp = self.rt.cfg.experiments_dir / e["name"] / "output" / "oof_fold_predictions.parquet"
+            if fp.exists():
+                parts.append(pl.read_parquet(str(fp)))
+            if isinstance(e.get("cv_score"), (int, float)):
+                fold_cv_scores.append(float(e["cv_score"]))
+        if len(parts) < n_folds:
+            return
+
+        merged = pl.concat(parts, how="vertical")
+        if "customer_id" in merged.columns:
+            merged = merged.unique(subset=["customer_id"], keep="first")
+
+        parent_out = self.rt.cfg.experiments_dir / parent_exp_name / "output"
+        parent_out.mkdir(parents=True, exist_ok=True)
+        final_oof = parent_out / "oof_predictions.parquet"
+        merged.write_parquet(str(final_oof))
+        parent = db.get_experiment(parent_exp_name) or {}
+        self._register_oof_predictions(parent_exp_name, parent_out, parent.get("test_score"))
+        if fold_cv_scores:
+            cv_score = float(sum(fold_cv_scores) / len(fold_cv_scores))
+            db.update_experiment(parent_exp_name, cv_score=cv_score)
+            db.add_log(parent_exp_name, f"Updated CV score from OOF folds: {cv_score:.6f}")
+        db.add_log(parent_exp_name, f"External OOF merged from {len(parts)} fold(s): {final_oof}")
+
+    def _run_oof_fold_in_thread(self, exp_name: str, gpu_id: int, task_payload: dict):
+        cfg = self.rt.cfg
+        exp_dir = cfg.experiments_dir / exp_name
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        out = exp_dir / "output"
+        out.mkdir(parents=True, exist_ok=True)
+
+        parent_exp = str(task_payload.get("parent_experiment") or "")
+        fold_idx = int(task_payload.get("fold_idx", 0))
+        n_folds = int(task_payload.get("n_folds", max(2, int(cfg.stacking_oof_folds))))
+        runner_path = Path(str(task_payload.get("oof_runner_path") or ""))
+        parent = db.get_experiment(parent_exp) or {}
+        parent_ws = Path(str(parent.get("workspace_dir") or ""))
+
+        db.update_experiment(exp_name, status="running", gpu_id=gpu_id, started_at=datetime.now().isoformat(), exp_dir=str(exp_dir))
+        db.add_log(exp_name, f"Starting external OOF fold {fold_idx + 1}/{n_folds} on GPU {gpu_id}")
+        t0 = time.time()
+        exit_code = -1
+        try:
+            if not parent_ws.exists() or not (parent_ws / "run.py").exists():
+                raise RuntimeError(f"Parent workspace/run.py not found for {parent_exp}")
+            if not runner_path.exists():
+                raise RuntimeError(f"OOF runner script not found: {runner_path}")
+
+            cn = f"oof-{exp_name}-gpu{gpu_id}"[:120]
+            cmd = self.docker_cmd + [
+                "run",
+                "--rm",
+                "--network=host",
+                "--name",
+                cn,
+                "--gpus",
+                f"device={gpu_id}",
+                "--entrypoint",
+                "python",
+                "-v",
+                f"{cfg.data_dir}:/app/data:ro",
+                "-v",
+                f"{parent_ws}:/app/workspace:ro",
+                "-v",
+                f"{out}:/app/output",
+                "-v",
+                f"{runner_path}:/app/oof_runner.py:ro",
+                cfg.docker_image,
+                "/app/oof_runner.py",
+                "--workspace",
+                "/app/workspace",
+                "--data-dir",
+                "/app/data",
+                "--output-dir",
+                "/app/output",
+                "--fold-idx",
+                str(fold_idx),
+                "--n-folds",
+                str(n_folds),
+            ]
+
+            log_path = exp_dir / "oof_fold.log"
+            with open(log_path, "w") as lf:
+                proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                deadline = time.time() + cfg.timeout_minutes * 60
+                while True:
+                    ret = proc.poll()
+                    if ret is not None:
+                        exit_code = ret
+                        break
+                    if time.time() > deadline:
+                        subprocess.run(self.docker_cmd + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
+                        proc.wait(timeout=60)
+                        exit_code = -1
+                        break
+                    time.sleep(5)
+
+            oof_pred = out / "oof_fold_predictions.parquet"
+            status = "completed" if exit_code == 0 and oof_pred.exists() else "failed"
+            notes = f"external OOF fold {fold_idx + 1}/{n_folds}"
+            if status == "failed" and not oof_pred.exists():
+                notes = "failed: missing oof_fold_predictions.parquet"
+            fold_cv = None
+            metrics_fp = out / "run_output" / "metrics.json"
+            if metrics_fp.exists():
+                try:
+                    metrics = json.loads(metrics_fp.read_text(errors="replace"))
+                    raw_cv = metrics.get(cfg.val_metric_key)
+                    if isinstance(raw_cv, (int, float)):
+                        fold_cv = float(raw_cv)
+                except Exception:
+                    fold_cv = None
+
+            db.update_experiment(
+                exp_name,
+                status=status,
+                finished_at=datetime.now().isoformat(),
+                exit_code=exit_code,
+                elapsed_min=round((time.time() - t0) / 60, 2),
+                notes=notes,
+                cv_score=fold_cv,
+            )
+            db.add_log(exp_name, f"OOF fold finished with status={status}, exit={exit_code}")
+            if status == "completed" and parent_exp:
+                self._aggregate_parent_oof(parent_exp)
+        except Exception as exc:
+            db.update_experiment(
+                exp_name,
+                status="failed",
+                finished_at=datetime.now().isoformat(),
+                exit_code=-2,
+                elapsed_min=round((time.time() - t0) / 60, 2),
+                notes=f"OOF ERROR: {exc}",
+            )
+            db.add_log(exp_name, f"OOF ERROR: {exc}", level="error")
+        finally:
+            with self.rt.lock:
+                self.rt.remove_experiment_from_gpu(gpu_id, exp_name)
+
     def worker_loop(self):
         last_sync_at = 0.0
         while self.rt.worker_running:
@@ -373,6 +966,7 @@ class OrchestratorService:
                     last_sync_at = now
 
                 started_any = False
+                blocked_in_cycle = 0
                 while True:
                     item = None
                     with self.rt.lock:
@@ -382,6 +976,20 @@ class OrchestratorService:
                             item = self.rt.auto_queue.popleft()
                     if item is None:
                         break
+
+                    if item.get("task_type") == "stacking":
+                        if not self._ensure_stacking_dependencies(item):
+                            blocked_in_cycle += 1
+                            with self.rt.lock:
+                                if item.get("auto"):
+                                    self.rt.auto_queue.append(item)
+                                else:
+                                    self.rt.manual_queue.append(item)
+                            with self.rt.lock:
+                                total_queued = len(self.rt.manual_queue) + len(self.rt.auto_queue)
+                            if total_queued <= blocked_in_cycle:
+                                break
+                            continue
 
                     with self.rt.lock:
                         gpu = self.rt.get_available_gpu()
@@ -399,6 +1007,7 @@ class OrchestratorService:
                         kwargs={
                             "reference_code": item.get("reference_code"),
                             "task_type": item.get("task_type", "experiment"),
+                            "task_payload": item,
                         },
                         daemon=True,
                     ).start()
@@ -432,8 +1041,11 @@ class OrchestratorService:
                         time.sleep(2)
                         continue
 
-                    self.orchestrator_log(f"Getting ideas (used: {len(used_idea_names)}, need {needed})...")
+                    self.orchestrator_log(
+                        f"Getting ideas (used: {len(used_idea_names)}, need {needed}, stacking_mode={self.rt.cfg.enable_stacking_mode})..."
+                    )
                     unused = feeder.get_unused_prompts(used_idea_names, limit=needed)
+                    unused = self._filter_and_prioritize_auto_ideas(unused, needed)
                     self.orchestrator_log(f"Got {len(unused)} idea(s)")
                     queued_now = 0
                     for idx, idea in enumerate(unused):
@@ -507,6 +1119,14 @@ class OrchestratorService:
             notes = "IMPROVED (recovered)"
             db.set_global("best_score", test)
             db.set_global("best_experiment", str(exp_dir / "workspace"))
+            db.add_log(exp_name, f"★ {notes}", level="success")
+            if cfg.notify_on_improvement:
+                self._notify(
+                    f"🎉 <b>NEW BEST SCORE! (recovered)</b>\n\n"
+                    f"📊 Project: <b>{cfg.name}</b>\n"
+                    f"📈 Score: <b>{test:.6f}</b> (was {best_score:.6f})\n"
+                    f"🧪 Experiment: <code>{exp_name}</code>"
+                )
 
         submission_path = out / "submission.parquet"
         has_submission = submission_path.exists()

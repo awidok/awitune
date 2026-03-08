@@ -47,6 +47,8 @@ def queue_idea(rt, cfg, idea: dict, idx: int, resolve_base_solution, orchestrato
         parent = base_exp if base_exp and base_exp != "default" else ""
         idea_task_type = str(idea.get("task_type", "experiment") or "experiment")
         idea_reasoning = str(idea.get("reasoning", "") or "")
+        stack_sources = idea.get("stack_sources") if isinstance(idea.get("stack_sources"), list) else []
+        stack_sources = [str(x).strip() for x in stack_sources if str(x).strip()]
 
         db.create_experiment(
             eid,
@@ -65,6 +67,7 @@ def queue_idea(rt, cfg, idea: dict, idx: int, resolve_base_solution, orchestrato
             "auto": True,
             "reference_code": idea.get("reference_code"),
             "task_type": idea_task_type,
+            "stack_sources": stack_sources,
         }
         with rt.lock:
             rt.auto_queue.append(item)

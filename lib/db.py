@@ -87,6 +87,10 @@ def init_db(conn=None):
         CREATE INDEX IF NOT EXISTS idx_exp_created ON experiments(created_at);
         CREATE INDEX IF NOT EXISTS idx_logs_exp ON experiment_logs(experiment_name);
     """)
+    cols = conn.execute("PRAGMA table_info(experiments)").fetchall()
+    col_names = {row[1] for row in cols}
+    if "cv_score" not in col_names:
+        conn.execute("ALTER TABLE experiments ADD COLUMN cv_score REAL")
     conn.commit()
 
 
@@ -109,7 +113,7 @@ def update_experiment(name, **kwargs):
         "status", "gpu_id", "container_name", "container_id",
         "exp_dir", "workspace_dir", "output_dir",
         "started_at", "finished_at",
-        "exit_code", "elapsed_min", "test_score", "val_score",
+        "exit_code", "elapsed_min", "test_score", "val_score", "cv_score",
         "improved", "notes", "config_json", "eval_json",
         "parent_experiment", "task_type",
     }
@@ -140,6 +144,47 @@ def get_all_experiments(limit=100, status=None):
         rows = db.execute(
             "SELECT * FROM experiments ORDER BY created_at DESC LIMIT ?",
             (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_dashboard_experiments(limit=500, status=None):
+    """
+    Lightweight experiment list for dashboard state polling.
+    Excludes large JSON blobs (eval/config) and truncates prompt.
+    """
+    db = get_db()
+    base_query = """
+        SELECT
+            name,
+            status,
+            substr(prompt, 1, 300) AS prompt,
+            base_solution,
+            parent_experiment,
+            task_type,
+            gpu_id,
+            created_at,
+            started_at,
+            finished_at,
+            exit_code,
+            elapsed_min,
+            test_score,
+            val_score,
+            cv_score,
+            improved,
+            notes,
+            workspace_dir
+        FROM experiments
+    """
+    if status:
+        rows = db.execute(
+            base_query + " WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            base_query + " ORDER BY created_at DESC LIMIT ?",
+            (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
 

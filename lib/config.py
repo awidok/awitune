@@ -40,6 +40,13 @@ class ProjectConfig:
     notify_on_failure: bool = True
     notify_on_completion: bool = False  # Every experiment completion
 
+    # Stacking orchestration mode
+    enable_stacking_mode: bool = False
+    stacking_min_base_share: float = 0.6
+    stacking_max_queue_share: float = 0.4
+    stacking_oof_folds: int = 5
+    stacking_oof_splitter: str = "MultilabelStratifiedKFold"
+
     # Resolved paths (set in __post_init__)
     data_dir: Path = field(default=None, repr=False)
     solutions_dir: Path = field(default=None, repr=False)

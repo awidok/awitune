@@ -84,6 +84,11 @@ The goal is to build MULTIPLE diverse solutions that can later be stacked. You s
    - If all solutions are neural, propose a tree-based approach
    - If all solutions use same features, propose different feature engineering
 
+4. **Include small tuning experiments too** — not every run should be a big refactor:
+   - Also propose lightweight experiments focused on hyperparameters/training recipe
+   - Examples: LR/scheduler, weight decay, dropout, batch size, warmup, EMA/SWA, loss coefficients
+   - These should be low-risk, fast-to-validate, and easy to compare
+
 IMPORTANT RULES:
 - ANALYSIS FIRST: If no recent analyst reports exist, propose analysis before experiments
 - DIVERSIFY: Build a portfolio of DIFFERENT solution families
@@ -91,6 +96,7 @@ IMPORTANT RULES:
 - Learn from failures — if something was tried and didn't work, don't repeat it
 - NEVER propose something already running or queued
 - Focus on approaches that are FUNDAMENTALLY different from what's been tried
+- Keep a MIX of proposal scope: some architecture-level ideas + some small hyperparameter tuning ideas
 - NO STACKING/BLENDING: Focus on improving individual models
 
 Respond with a JSON array of task objects. Each object must have:
@@ -103,8 +109,10 @@ Respond with a JSON array of task objects. Each object must have:
   "reference_code": null or {
     "experiment": "name of another experiment whose code contains useful ideas",
     "what_to_take": "What specifically to incorporate"
-  }
+  },
+  "stack_sources": ["exp_A", "exp_B", "exp_C"]
 }
+`stack_sources` is optional for non-stacking tasks, but required for `task_type="stacking"`.
 
 Return ONLY valid JSON — no markdown fences, no commentary outside the array.
 """
@@ -115,6 +123,30 @@ def configure(cfg: ProjectConfig):
     global _cfg
     _cfg = cfg
     configure_tools(cfg)
+
+
+def build_system_prompt() -> str:
+    prompt = SYSTEM_PROMPT
+    if not _cfg or not _cfg.enable_stacking_mode:
+        return prompt
+
+    prompt = prompt.replace(
+        '- NO STACKING/BLENDING: Focus on improving individual models',
+        (
+            "- STACKING MODE ENABLED: you may propose limited stacking/blending ideas when useful.\n"
+            "- Keep base-model work dominant: at least half of proposed tasks should be non-stacking.\n"
+            "- If proposing stacking, reuse existing OOF predictions from prior experiments where possible."
+        ),
+    )
+    prompt = prompt.replace(
+        '"task_type": "experiment" or "analysis",',
+        '"task_type": "experiment", "analysis", or "stacking",',
+    )
+    prompt += (
+        "\nIf task_type is 'stacking', always include stack_sources with 2-5 experiment names "
+        "that should be stacked together."
+    )
+    return prompt
 
 
 def build_compact_context() -> dict:
@@ -140,11 +172,13 @@ def build_compact_context() -> dict:
     # Build compact experiment list (just names and scores)
     experiments = []
     scored = []
+    cv_scored = []
     for e in all_completed:
         exp_info = {
             "name": e.get("name", ""),
             "test_score": e.get("test_score"),
             "val_score": e.get("val_score"),
+            "cv_score": e.get("cv_score"),
             "improved": e.get("improved", False),
             "status": e.get("status"),
             "created_at": e.get("created_at", ""),
@@ -152,12 +186,16 @@ def build_compact_context() -> dict:
         experiments.append(exp_info)
         if e.get("test_score"):
             scored.append(exp_info)
+        if e.get("cv_score") is not None:
+            cv_scored.append(exp_info)
 
     # Sort by score
     if _cfg.metric_direction == "maximize":
         scored.sort(key=lambda x: x.get("test_score", 0), reverse=True)
+        cv_scored.sort(key=lambda x: x.get("cv_score", 0), reverse=True)
     else:
         scored.sort(key=lambda x: x.get("test_score", float("inf")))
+        cv_scored.sort(key=lambda x: x.get("cv_score", float("inf")))
 
     return {
         "readme": readme,
@@ -167,6 +205,7 @@ def build_compact_context() -> dict:
         "queued": [{"name": e.get("name"), "prompt": (e.get("prompt") or "")[:100]} for e in queued],
         "experiments": experiments[-50:],  # Last 50 experiments
         "top_experiments": [e["name"] for e in scored[:5]],  # Top 5 names
+        "top_cv_experiments": [e["name"] for e in cv_scored[:5]],
     }
 
 
@@ -201,18 +240,25 @@ def build_user_prompt(ctx: dict, count: int) -> str:
     if experiments:
         parts.append("## Experiment Summary\n")
         parts.append("Use `get_experiment_summary(name)` for details, `get_experiment_code(name)` for code.\n")
-        parts.append("| Name | Score | Improved? |")
-        parts.append("|------|-------|-----------|")
+        parts.append("| Name | Test | Val | CV | Improved? |")
+        parts.append("|------|------|-----|----|-----------|")
         for exp in experiments[-30:]:  # Last 30
-            score = f"{exp['test_score']:.6f}" if exp.get("test_score") else "N/A"
+            test_score = f"{exp['test_score']:.6f}" if exp.get("test_score") is not None else "N/A"
+            val_score = f"{exp['val_score']:.6f}" if exp.get("val_score") is not None else "N/A"
+            cv_score = f"{exp['cv_score']:.6f}" if exp.get("cv_score") is not None else "N/A"
             imp = "★" if exp.get("improved") else ""
-            parts.append(f"| {exp['name']} | {score} | {imp} |")
+            parts.append(f"| {exp['name']} | {test_score} | {val_score} | {cv_score} | {imp} |")
         parts.append("")
 
     # Top experiments hint
     if ctx.get("top_experiments"):
         parts.append("## Top Experiments (fetch code with get_experiment_code)\n")
         for name in ctx["top_experiments"]:
+            parts.append(f"- {name}")
+        parts.append("")
+    if ctx.get("top_cv_experiments"):
+        parts.append("## Top CV Experiments (OOF quality signal)\n")
+        for name in ctx["top_cv_experiments"]:
             parts.append(f"- {name}")
         parts.append("")
 
@@ -355,6 +401,9 @@ def parse_ideas(response_text: str) -> list[dict]:
         ideas = [ideas]
     validated = []
     for idea in ideas:
+        raw_sources = idea.get("stack_sources")
+        if not isinstance(raw_sources, list):
+            raw_sources = []
         validated.append({
             "name": str(idea.get("name", "unnamed")),
             "task_type": str(idea.get("task_type", "experiment")),
@@ -362,6 +411,7 @@ def parse_ideas(response_text: str) -> list[dict]:
             "base_experiment": str(idea.get("base_experiment", "default")),
             "prompt": str(idea.get("prompt", "")),
             "reference_code": idea.get("reference_code"),
+            "stack_sources": [str(x) for x in raw_sources if str(x).strip()],
         })
     return validated
 
@@ -374,7 +424,7 @@ def generate_ideas(count: int = 1) -> list[dict]:
     print(f"  Context: {len(ctx['experiments'])} experiments, prompt: {len(user_prompt)} chars")
     
     try:
-        response_text = call_openai_with_tools(SYSTEM_PROMPT, user_prompt)
+        response_text = call_openai_with_tools(build_system_prompt(), user_prompt)
         print(f"  LLM response: {len(response_text)} chars")
         if not response_text:
             print("  WARNING: Empty response from LLM")

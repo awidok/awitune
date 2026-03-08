@@ -224,6 +224,9 @@ def api_launch():
     name = d.get("name", "")
     base_experiment = d.get("base_experiment", "")
     task_type = d.get("task_type", "experiment")
+    stack_sources = d.get("stack_sources", [])
+    if not isinstance(stack_sources, list):
+        stack_sources = []
     base = resolve_base_solution(base_experiment)
     parent = base_experiment if base_experiment and base_experiment != "default" else ""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -232,7 +235,13 @@ def api_launch():
     eid = f"{prefix}_{safe_name}_{ts}" if safe_name else f"{prefix}_{ts}"
     db.create_experiment(eid, prompt=prompt, base_solution=base, parent_experiment=parent, task_type=task_type)
     db.add_log(eid, f"Queued {task_type}: {prompt[:100]}")
-    item = {"id": eid, "prompt": prompt, "base_solution": base, "task_type": task_type}
+    item = {
+        "id": eid,
+        "prompt": prompt,
+        "base_solution": base,
+        "task_type": task_type,
+        "stack_sources": [str(x).strip() for x in stack_sources if str(x).strip()],
+    }
     with rt.lock:
         rt.manual_queue.append(item)
     if not rt.worker_running:

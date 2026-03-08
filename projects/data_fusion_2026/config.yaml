@@ -17,3 +17,10 @@ telegram_chat_id: "226095842"
 notify_on_improvement: true
 notify_on_failure: true
 notify_on_completion: false
+
+# Stacking orchestration mode
+enable_stacking_mode: true
+stacking_min_base_share: 0.6
+stacking_max_queue_share: 0.4
+stacking_oof_folds: 5
+stacking_oof_splitter: MultilabelStratifiedKFold

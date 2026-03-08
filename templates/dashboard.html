@@ -169,10 +169,14 @@ async function rf(){
         document.getElementById('el').innerHTML=exps.map(e=>{
             const active=sel===e.name?'a':'';
             let sc='fl',sv='N/A';
+            let cv='N/A';
             const gpu = e.gpu_id ?? e.gpu ?? '?';
             if(e.status==='running'){sc='rn';sv='⏳'}
             else if(e.test_score && e.test_score > 0){
                 sv=parseFloat(e.test_score).toFixed(6);sc=e.improved?'ok':'';
+            }
+            if(e.cv_score!==null && e.cv_score!==undefined){
+                cv=parseFloat(e.cv_score).toFixed(6);
             }
 
             let timeStr;
@@ -192,7 +196,7 @@ async function rf(){
             const ttBadge=e.task_type==='analysis'?'<span style="background:#1f6feb;color:#fff;padding:0 4px;border-radius:3px;font-size:9px;margin-right:4px">🔍</span>':'';
             return `<div class="ei ${active}" onclick="se('${e.name}')">
                 <div><div class="n">${ttBadge}${e.name}</div>
-                <div class="m">GPU ${gpu} · ${timeStr} ${parentTag}</div></div>
+                <div class="m">GPU ${gpu} · ${timeStr} · CV ${cv} ${parentTag}</div></div>
                 <div style="display:flex;align-items:center;gap:4px">
                     <span class="s ${sc}">${sv}</span>
                     ${stopBtn}${forkBtn}${restartBtn}${delBtn}
@@ -222,6 +226,7 @@ async function rf(){
                 document.getElementById('mb').innerHTML=`
                     <div class="mc"><div class="v" style="color:${s.test_score&&s.test_score!=='N/A'?'#3fb950':'#8b949e'}">${s.test_score&&s.test_score!=='N/A'?parseFloat(s.test_score).toFixed(6):'—'}</div><div class="l">Test Score</div></div>
                     <div class="mc"><div class="v" style="color:#58a6ff">${s.val_score&&s.val_score!=='N/A'?parseFloat(s.val_score).toFixed(6):'—'}</div><div class="l">Val Score</div></div>
+                    <div class="mc"><div class="v" style="color:#a371f7">${s.cv_score!==null&&s.cv_score!==undefined?parseFloat(s.cv_score).toFixed(6):'—'}</div><div class="l">CV Score</div></div>
                     <div class="mc"><div class="v" style="color:${timeColor}">${timeVal}</div><div class="l">${s.status==='running'?'Running for':'Time'}</div></div>
                     <div class="mc"><div class="v" style="color:${s.exit_code===0?'#3fb950':s.status==='running'?'#d29922':'#f85149'}">${s.status==='running'?'⏳':(s.exit_code??'—')}</div><div class="l">Exit</div></div>
                     ${s.parent_experiment?`<div class="mc" style="min-width:100px"><div class="v" style="font-size:12px;color:#58a6ff;cursor:pointer" onclick="se('${s.parent_experiment}')">← ${s.parent_experiment.slice(0,25)}</div><div class="l">Parent</div></div>`:''}
