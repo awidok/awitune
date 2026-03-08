@@ -46,8 +46,8 @@ def cmd_run(args):
     if args.gpus:
         cfg.gpus = [int(g) for g in args.gpus.split(",")]
 
-    from . import idea_feeder, generate_ideas
     from .lib import db
+    from .lib import idea_feeder, generate_ideas
     from .dashboard import app, init_app, start_proxy, start_worker, rt, recover_orphaned_experiments
     from .lib.orchestrator_tools import configure as configure_tools
 

@@ -7,7 +7,7 @@ No static prompts - everything is dynamic based on experiment history.
 
 import traceback
 
-from .lib.config import ProjectConfig
+from .config import ProjectConfig
 
 
 def configure(cfg: ProjectConfig):

@@ -669,7 +669,7 @@ def _finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp
 # ---- Auto-feeder ----
 def _get_idea_feeder():
     try:
-        from . import idea_feeder
+        from .lib import idea_feeder
         return idea_feeder
     except ImportError:
         return None
