@@ -38,6 +38,7 @@ from .lib.orchestrator_queue import (
     queue_idea as queue_queue_idea,
 )
 from .lib.notifications import send_telegram_notification as notify_telegram
+from .lib.orchestrator_service import OrchestratorService
 from .lib.orchestrator_workspace import (
     analyst_reports_dir as ws_analyst_reports_dir,
     build_reference_code_section as ws_build_reference_code_section,
@@ -64,48 +65,30 @@ def send_telegram_notification(message: str, parse_mode: str = "HTML"):
 
 
 def trim_auto_queue(max_size: int = MAX_AUTO_QUEUE_SIZE) -> int:
-    """Keep only first N auto-queued tasks. Manual queue is untouched."""
-    removed = []
-    with rt.lock:
-        while len(rt.auto_queue) > max_size:
-            removed.append(rt.auto_queue.pop())
-
-    for item in removed:
-        exp_id = item.get("id", "")
-        if not exp_id:
-            continue
-        db.update_experiment(exp_id, status="cancelled", notes=f"Auto queue trimmed to {max_size}")
-        db.add_log(exp_id, f"Removed from auto-queue (limit {max_size})", level="warning")
-
-    if removed:
-        orchestrator_log(f"Trimmed auto queue: removed {len(removed)} item(s), kept {max_size}")
-    return len(removed)
+    return orch.trim_auto_queue(max_size)
 
 
 DOCKER_CMD = get_docker_cmd()
 rt = RuntimeState(DOCKER_CMD)
+orch = OrchestratorService(rt, DOCKER_CMD, AWITUNE_DIR, PROXY_HOST, OPENAI_API_KEY, orchestrator_log)
 
 
 def _force_rmtree(path: Path):
-    try:
-        shutil.rmtree(path)
-    except PermissionError:
-        subprocess.run(["chmod", "-R", "u+rwX", str(path)], capture_output=True, timeout=30)
-        shutil.rmtree(path, ignore_errors=True)
+    orch._force_rmtree(path)
 
 
 # ---- Proxy ----
 def start_proxy():
-    runtime_start_proxy(rt, AWITUNE_DIR, PROXY_HOST)
+    orch.start_proxy()
 
 
 def stop_proxy():
-    runtime_stop_proxy(rt)
+    orch.stop_proxy()
 
 
 # ---- Workspace ----
 def resolve_base_solution(base_experiment: str) -> str:
-    return ws_resolve_base_solution(rt.cfg, base_experiment)
+    return orch.resolve_base_solution(base_experiment)
 
 
 def build_reference_code_section(reference_code: dict) -> str:
@@ -161,323 +144,41 @@ def _has_result_event(events_file: Path, tail_bytes: int = 65536) -> bool:
 # ---- Agent runner ----
 def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
                         reference_code=None, task_type="experiment"):
-    cfg = rt.cfg
-    exp_dir = cfg.experiments_dir / exp_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    is_analysis = task_type == "analysis"
-
-    db.update_experiment(exp_name, status="running", gpu_id=gpu_id,
-                         started_at=datetime.now().isoformat(),
-                         exp_dir=str(exp_dir))
-    db.add_log(exp_name, f"Starting {'analysis' if is_analysis else 'experiment'} on GPU {gpu_id}")
-
-    t0 = time.time()
-    try:
-        start_proxy()
-        direction = cfg.best_score_sort_key()
-        stats = db.get_stats(direction)
-        best_score = stats.get("best_score", 0) or 0
-        prev_exps = db.get_all_experiments(limit=20, status="completed")
-
-        if is_analysis:
-            ws = prepare_analyst_workspace(exp_dir, prompt, prev_exps)
-        else:
-            ws = prepare_workspace(base_solution or str(cfg.solutions_dir / "baseline"),
-                                   exp_dir, prompt, best_score, prev_exps,
-                                   reference_code=reference_code)
-        db.update_experiment(exp_name, workspace_dir=str(ws), output_dir=str(exp_dir / "output"))
-
-        cn = f"agent-{exp_name}-gpu{gpu_id}"
-        db.update_experiment(exp_name, container_name=cn)
-        out = exp_dir / "output"
-
-        proxy_port = cfg.proxy_port
-        cmd = DOCKER_CMD + [
-            "run", "--rm", "--network=host", "--name", cn,
-            "--gpus", f'device={gpu_id}',
-            "--ulimit", "core=0",
-            "-v", f"{cfg.data_dir}:/app/data:ro",
-            "-v", f"{ws}:/app/workspace",
-            "-v", f"{out}:/app/output",
-            "-v", f"{exp_dir/'CLAUDE.md'}:/app/CLAUDE.md:ro",
-            "-v", "/etc/ssl/certs:/etc/ssl/certs:ro",
-            "-v", "/etc/pki:/etc/pki:ro",
-            "-e", f"PROXY_HOST={PROXY_HOST}", "-e", f"PROXY_PORT={proxy_port}",
-            "-e", f"OPENAI_API_KEY={OPENAI_API_KEY}",
-            "-e", f"ANTHROPIC_BASE_URL=http://{PROXY_HOST}:{proxy_port}",
-            "-e", f"ANTHROPIC_API_KEY={OPENAI_API_KEY or 'dummy-key'}",
-            "-e", f"ANTHROPIC_AUTH_TOKEN={OPENAI_API_KEY or 'dummy-key'}",
-            "-e", "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
-            "-e", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
-            "-e", "NODE_TLS_REJECT_UNAUTHORIZED=0",
-            "-e", "CUDA_VISIBLE_DEVICES=0", "-e", "CUDA_DEVICE=cuda:0",
-            "-e", f"MAX_TURNS={cfg.max_turns}", cfg.docker_image,
-        ]
-
-        db.add_log(exp_name, f"Docker command: {' '.join(cmd[:10])}...")
-        lp = exp_dir / "agent.log"
-        events_file = out / "events.jsonl"
-        GRACE_PERIOD = 180  # 3 minutes to allow graceful shutdown
-        with open(lp, "w") as lf:
-            # Use start_new_session=True to detach from terminal and prevent signal propagation
-            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-            deadline = time.time() + cfg.timeout_minutes * 60
-            agent_done_at = None
-            ec = None
-            while True:
-                ret = proc.poll()
-                if ret is not None:
-                    ec = ret
-                    break
-                if time.time() > deadline:
-                    db.add_log(exp_name, "TIMEOUT — stopping container gracefully", level="error")
-                    # Use docker stop for graceful shutdown (SIGTERM then SIGKILL after 30s)
-                    subprocess.run(DOCKER_CMD + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
-                    proc.wait(timeout=60)
-                    ec = -1
-                    break
-                if agent_done_at is None and _has_result_event(events_file):
-                    agent_done_at = time.time()
-                    db.add_log(exp_name, "Agent finished, waiting for container to exit...")
-                if agent_done_at and time.time() - agent_done_at > GRACE_PERIOD:
-                    db.add_log(exp_name, f"Container still running after {GRACE_PERIOD}s, stopping gracefully", level="warning")
-                    # Use docker stop for graceful shutdown
-                    subprocess.run(DOCKER_CMD + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
-                    proc.wait(timeout=60)
-                    ec = proc.returncode
-                    break
-                time.sleep(10)
-
-        elapsed = time.time() - t0
-        db.add_log(exp_name, f"Finished in {elapsed/60:.1f}min, exit={ec}")
-
-        if is_analysis:
-            _finalize_analysis(exp_name, exp_dir, out, elapsed, ec)
-        else:
-            _finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp)
-
-    except Exception as e:
-        db.update_experiment(exp_name,
-                             status="failed",
-                             finished_at=datetime.now().isoformat(),
-                             exit_code=-2,
-                             elapsed_min=round((time.time() - t0) / 60, 2),
-                             notes=f"ERROR: {e}")
-        db.add_log(exp_name, f"ERROR: {e}", level="error")
-        
-        # Send Telegram notification on failure
-        if rt.cfg.notify_on_failure:
-            send_telegram_notification(
-                f"❌ <b>Experiment FAILED</b>\n\n"
-                f"📊 Project: <b>{rt.cfg.name}</b>\n"
-                f"🧪 Experiment: <code>{exp_name}</code>\n"
-                f"⏱️ Time: {(time.time() - t0)/60:.1f} min\n"
-                f"⚠️ Error: <pre>{str(e)[:500]}</pre>"
-            )
-    finally:
-        with rt.lock:
-            rt.remove_experiment_from_gpu(gpu_id, exp_name)
+    return orch.run_agent_in_thread(exp_name, prompt, base_solution, gpu_id, reference_code=reference_code, task_type=task_type)
 
 
 def _finalize_analysis(exp_name, exp_dir, out, elapsed, ec):
-    reports_dir = _analyst_reports_dir()
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    report_src = out / "analysis_report.md"
-    data_src = out / "analysis_data.json"
-    if report_src.exists():
-        dest = reports_dir / f"{exp_name}.md"
-        shutil.copy2(report_src, dest)
-        db.add_log(exp_name, f"Analysis report saved to {dest}", level="success")
-    if data_src.exists():
-        shutil.copy2(data_src, reports_dir / f"{exp_name}.json")
-
-    has_report = report_src.exists()
-    db.update_experiment(exp_name,
-                         status="completed",
-                         finished_at=datetime.now().isoformat(),
-                         exit_code=ec,
-                         elapsed_min=round(elapsed / 60, 2),
-                         notes="analysis complete" if has_report else "analysis finished (no report)")
+    return orch._finalize_analysis(exp_name, exp_dir, out, elapsed, ec)
 
 
 def _finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp):
-    _run_evaluate(out, lp)
-    ev = _read_eval_results(out)
-    test, val = _extract_metrics(ev)
-
-    improved = False
-    notes = "no improvement"
-    if test and rt.cfg.is_better(test, best_score):
-        improved = True
-        notes = f"IMPROVED {best_score:.6f} → {test:.6f}"
-        db.set_global("best_score", test)
-        db.set_global("best_experiment", str(exp_dir / "workspace"))
-        db.add_log(exp_name, f"★ {notes}", level="success")
-        
-        # Send Telegram notification on improvement
-        if rt.cfg.notify_on_improvement:
-            send_telegram_notification(
-                f"🎉 <b>NEW BEST SCORE!</b>\n\n"
-                f"📊 Project: <b>{rt.cfg.name}</b>\n"
-                f"📈 Score: <b>{test:.6f}</b> (was {best_score:.6f})\n"
-                f"🧪 Experiment: <code>{exp_name}</code>\n"
-                f"⏱️ Time: {elapsed/60:.1f} min"
-            )
-
-    db.update_experiment(exp_name,
-                         status="completed",
-                         finished_at=datetime.now().isoformat(),
-                         exit_code=ec,
-                         elapsed_min=round(elapsed / 60, 2),
-                         test_score=test if test else None,
-                         val_score=val if val else None,
-                         improved=1 if improved else 0,
-                         notes=notes,
-                         eval_json=json.dumps(ev))
-    
-    # Send Telegram notification on completion (if enabled)
-    if rt.cfg.notify_on_completion and not improved:
-        status_emoji = "✅" if ec == 0 else "❌"
-        send_telegram_notification(
-            f"{status_emoji} <b>Experiment completed</b>\n\n"
-            f"📊 Project: <b>{rt.cfg.name}</b>\n"
-            f"📈 Score: {test:.6f if test else 'N/A'}\n"
-            f"🧪 Experiment: <code>{exp_name}</code>\n"
-            f"⏱️ Time: {elapsed/60:.1f} min\n"
-            f"📝 Notes: {notes}"
-        )
+    return orch._finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp)
 
 
 # ---- Auto-feeder ----
 def _get_idea_feeder():
-    try:
-        from .lib import idea_feeder
-        return idea_feeder
-    except ImportError:
-        return None
+    return orch._get_idea_feeder()
 
 
 # ---- Worker ----
 def _collect_used_idea_names() -> set:
-    return queue_collect_used_idea_names(rt)
+    return collect_used_idea_names(rt)
 
 
 def _queue_idea(idea: dict, idx: int) -> bool:
-    return queue_queue_idea(rt, rt.cfg, idea, idx, resolve_base_solution, orchestrator_log)
+    return queue_idea(rt, rt.cfg, idea, idx, resolve_base_solution, orchestrator_log)
 
 
 def worker_loop():
-    """Main worker loop: syncs Docker state, processes queues, and auto-feeds ideas."""
-    last_sync_at = 0.0
-    while rt.worker_running:
-        try:
-            now = time.time()
-            if now - last_sync_at >= 15:
-                rt.sync_running_from_docker()
-                last_sync_at = now
-
-            # Try to start as many experiments as we have available slots
-            started_any = False
-
-            while True:
-                item = None
-                with rt.lock:
-                    if rt.manual_queue:
-                        item = rt.manual_queue.popleft()
-                    elif rt.auto_queue:
-                        item = rt.auto_queue.popleft()
-
-                if item is None:
-                    break
-
-                with rt.lock:
-                    gpu = rt.get_available_gpu()
-                    if gpu is None:
-                        # No slots available, put item back
-                        if item.get("auto"):
-                            rt.auto_queue.appendleft(item)
-                        else:
-                            rt.manual_queue.appendleft(item)
-                        break  # No more slots, stop trying
-                    else:
-                        rt.add_experiment_to_gpu(gpu, item["id"])
-
-                # Start the experiment thread
-                threading.Thread(
-                    target=run_agent_in_thread,
-                    args=(item["id"], item.get("prompt", ""), item.get("base_solution", ""), gpu),
-                    kwargs={
-                        "reference_code": item.get("reference_code"),
-                        "task_type": item.get("task_type", "experiment"),
-                    },
-                    daemon=True
-                ).start()
-                started_any = True
-                time.sleep(0.5)  # Small delay between starts to avoid race conditions
-
-            # Auto-feed: refill queue if needed
-            if not started_any:
-                trim_auto_queue(MAX_AUTO_QUEUE_SIZE)
-                
-                with rt.lock:
-                    if len(rt.auto_queue) > 0:
-                        time.sleep(2)
-                        continue
-
-                used_idea_names = _collect_used_idea_names()
-
-                feeder = _get_idea_feeder()
-                if not feeder:
-                    orchestrator_log("No feeder available")
-                    time.sleep(2)
-                    continue
-
-                # Calculate how many slots we need to fill
-                slots_per_gpu = rt.cfg.slots_per_gpu if rt.cfg else 1
-                total_slots = len(rt.cfg.gpus) * slots_per_gpu if rt.cfg else 1
-
-                with rt.lock:
-                    running_count = sum(len(exps) for exps in rt.running_gpus.values())
-                    queued_auto_count = len(rt.auto_queue)
-                    queued_manual_count = len(rt.manual_queue)
-                    needed = total_slots - running_count - queued_auto_count - queued_manual_count
-                    max_auto_to_add = MAX_AUTO_QUEUE_SIZE - queued_auto_count
-                    needed = min(needed, max_auto_to_add)
-
-                if needed <= 0:
-                    time.sleep(2)
-                    continue
-
-                orchestrator_log(f"Getting ideas (used: {len(used_idea_names)}, need {needed})...")
-                unused = feeder.get_unused_prompts(used_idea_names, limit=needed)
-                orchestrator_log(f"Got {len(unused)} idea(s)")
-
-                queued_now = 0
-                for idx, idea in enumerate(unused):
-                    if _queue_idea(idea, idx):
-                        queued_now += 1
-
-                if queued_now:
-                    orchestrator_log(f"Queued total: {queued_now}/{len(unused)}")
-
-                time.sleep(2)
-            else:
-                time.sleep(1)  # Brief pause before next iteration
-        except Exception as e:
-            orchestrator_log(f"Worker loop error (continuing): {e}")
-            time.sleep(2)
+    return orch.worker_loop()
 
 
 def start_worker():
-    if rt.worker_running:
-        return
-    rt.worker_running = True
-    rt.worker_thread = threading.Thread(target=worker_loop, daemon=True)
-    rt.worker_thread.start()
+    return orch.start_worker()
 
 
 def stop_worker():
-    rt.worker_running = False
+    return orch.stop_worker()
 
 
 # ---- Routes ----
@@ -1068,160 +769,27 @@ def api_analyst_report(name):
 # ---- Orphan recovery ----
 
 def _check_agent_finished(events_file):
-    return _has_result_event(events_file)
+    return eval_has_result_event(events_file)
 
 
 def _get_events_file_age(events_file: Path) -> float:
-    """Get age of events.jsonl in seconds. Returns infinity if file doesn't exist."""
-    if not events_file.exists():
-        return float('inf')
-    try:
-        import os
-        mtime = os.path.getmtime(events_file)
-        return time.time() - mtime
-    except Exception:
-        return float('inf')
+    return orch._get_events_file_age(events_file)
 
 
 def _find_container_name(exp_name, active_containers):
-    for cn in active_containers:
-        if exp_name in cn:
-            return cn
-    return None
+    return orch._find_container_name(exp_name, active_containers)
 
 
 def _finalize_experiment(exp_name, best_score):
-    cfg = rt.cfg
-    exp_dir = cfg.experiments_dir / exp_name
-    out = exp_dir / "output"
-
-    elapsed_min = None
-    exp = db.get_experiment(exp_name)
-    if exp and exp.get("started_at"):
-        try:
-            started = datetime.fromisoformat(exp["started_at"])
-            elapsed_min = round((datetime.now() - started).total_seconds() / 60, 2)
-        except Exception:
-            pass
-
-    task_type = (exp.get("task_type") or "experiment") if exp else "experiment"
-    if task_type == "analysis":
-        _finalize_analysis(exp_name, exp_dir, out, (elapsed_min or 0) * 60, None)
-        db.add_log(exp_name, "Recovered analyst task after restart")
-        return "completed", 0
-
-    if out.exists():
-        _run_evaluate(out)
-
-    ev = _read_eval_results(out)
-    test, val = _extract_metrics(ev)
-
-    improved = False
-    notes = "recovered after restart"
-    if test and cfg.is_better(test, best_score):
-        improved = True
-        notes = f"IMPROVED (recovered)"
-        db.set_global("best_score", test)
-        db.set_global("best_experiment", str(exp_dir / "workspace"))
-
-    submission_path = out / "submission.parquet"
-    has_submission = submission_path.exists()
-    has_eval = bool(ev)
-    has_result_event = _check_agent_finished(out / "events.jsonl")
-    # A recovered run is considered successful only when it produced measurable outputs.
-    status = "completed" if (has_eval or has_submission) else "failed"
-    if status == "failed":
-        if has_result_event:
-            notes = "recovered after restart (agent finished but no eval/submission)"
-        else:
-            notes = "recovered after restart (stuck or interrupted before result/eval)"
-
-    recovered_exit_code = exp.get("exit_code") if exp else None
-    if status == "failed" and recovered_exit_code is None:
-        recovered_exit_code = -3
-    db.update_experiment(exp_name,
-                         status=status,
-                         finished_at=datetime.now().isoformat(),
-                         exit_code=recovered_exit_code,
-                         elapsed_min=elapsed_min,
-                         test_score=test if test else None,
-                         val_score=val if val else None,
-                         improved=1 if improved else 0,
-                         notes=notes,
-                         eval_json=json.dumps(ev) if ev else None)
-    db.add_log(exp_name, f"Recovered: {status}, test={test or 'N/A'}")
-    return status, test
+    return orch._finalize_experiment(exp_name, best_score)
 
 
 def _monitor_orphaned_container(exp_name, container_name, gpu_id):
-    STUCK_THRESHOLD = 600  # 10 minutes without events.jsonl update = stuck
-    events_file = rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
-    agent_done_logged = False
-    db.add_log(exp_name, f"Resumed monitoring (container {container_name})")
-    
-    while True:
-        try:
-            r = subprocess.run(
-                DOCKER_CMD + ["inspect", container_name, "--format", "{{.State.Running}}"],
-                capture_output=True, text=True, timeout=5)
-            if r.stdout.strip() != "true":
-                break
-        except Exception:
-            break
-        
-        # Check if agent finished (has "result" in events.jsonl)
-        if not agent_done_logged and _check_agent_finished(events_file):
-            agent_done_logged = True
-            db.add_log(exp_name, "Agent finished (found 'result' in events.jsonl), waiting for container to exit...")
-        
-        # Check if container is stuck (no events.jsonl updates for too long)
-        events_age = _get_events_file_age(events_file)
-        if events_age > STUCK_THRESHOLD and not agent_done_logged:
-            db.add_log(exp_name, f"Container appears stuck (no events.jsonl updates for {events_age:.0f}s)", level="warning")
-        
-        time.sleep(10)
-
-    direction = rt.cfg.best_score_sort_key()
-    best_score = db.get_stats(direction).get("best_score", 0) or 0
-    _finalize_experiment(exp_name, best_score)
-    with rt.lock:
-        rt.remove_experiment_from_gpu(gpu_id, exp_name)
+    return orch._monitor_orphaned_container(exp_name, container_name, gpu_id)
 
 
 def recover_orphaned_experiments():
-    try:
-        r = subprocess.run(DOCKER_CMD + ["ps", "--filter", "name=agent-", "--format", "{{.Names}}"],
-                           capture_output=True, text=True, timeout=5)
-        active_containers = set(r.stdout.strip().split("\n")) if r.stdout.strip() else set()
-    except Exception:
-        active_containers = set()
-
-    running_exps = db.get_all_experiments(limit=200, status="running")
-    if not running_exps:
-        return
-
-    direction = rt.cfg.best_score_sort_key()
-    best_score = db.get_stats(direction).get("best_score", 0) or 0
-    recovered = monitored = 0
-    for exp in running_exps:
-        exp_name = exp["name"]
-        gpu_id = exp.get("gpu_id")
-        cn = _find_container_name(exp_name, active_containers)
-        if cn:
-            if gpu_id is not None:
-                with rt.lock:
-                    rt.add_experiment_to_gpu(gpu_id, exp_name)
-            db.add_log(exp_name, f"Resuming monitoring for orphaned experiment on GPU {gpu_id}")
-            threading.Thread(target=_monitor_orphaned_container,
-                             args=(exp_name, cn, gpu_id), daemon=True).start()
-            monitored += 1
-        else:
-            _finalize_experiment(exp_name, best_score)
-            recovered += 1
-    if recovered:
-        print(f"  Recovered {recovered} orphaned experiment(s)")
-    if monitored:
-        print(f"  Resumed monitoring for {monitored} experiment(s)")
+    return orch.recover_orphaned_experiments()
 
 
 # ---- Main init (called from cli.py) ----
