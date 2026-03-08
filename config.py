@@ -26,11 +26,19 @@ class ProjectConfig:
 
     # Resources
     gpus: list[int] = field(default_factory=lambda: [0])
+    slots_per_gpu: int = 1  # Number of concurrent experiments per GPU
     timeout_minutes: int = 480
     max_turns: int = 500
 
     # Proxy
     proxy_port: int = 8081
+
+    # Telegram notifications
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    notify_on_improvement: bool = True
+    notify_on_failure: bool = True
+    notify_on_completion: bool = False  # Every experiment completion
 
     # Resolved paths (set in __post_init__)
     data_dir: Path = field(default=None, repr=False)

@@ -6,6 +6,14 @@ val_metric_key: val_macro_roc_auc
 metric_direction: maximize
 
 gpus: [0, 1, 2, 3, 4, 5]
+slots_per_gpu: 2
 timeout_minutes: 480
 max_turns: 500
 proxy_port: 8081
+
+# Telegram notifications
+telegram_bot_token: "8766105389:AAGQuZ4alw00Y2f4P3uHLx0QdVfg4Aol6xA"
+telegram_chat_id: "226095842"
+notify_on_improvement: true
+notify_on_failure: true
+notify_on_completion: false

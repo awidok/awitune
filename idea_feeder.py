@@ -39,11 +39,11 @@ def get_all_prompts():
     return ideas
 
 
-def get_unused_prompts(used_names: set) -> list:
+def get_unused_prompts(used_names: set, limit: int = 3) -> list:
     """Return unused prompts - always generate fresh via LLM."""
-    new_ideas = _try_llm_generation(count=3)
+    new_ideas = _try_llm_generation(count=limit)
     if new_ideas:
         unused_new = [i for i in new_ideas if i["name"] not in used_names]
         if unused_new:
-            return unused_new
+            return unused_new[:limit]
     return []

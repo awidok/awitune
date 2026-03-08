@@ -33,6 +33,7 @@ CORS(app)
 
 # ---- Orchestrator log ----
 ORCHESTRATOR_LOG_PATH = Path("/tmp/awitune_orchestrator.log")
+MAX_AUTO_QUEUE_SIZE = 5
 
 
 def clean_output(text: str) -> str:
@@ -55,19 +56,74 @@ def orchestrator_log(message: str):
     print(f"[orchestrator] {message}", flush=True)
 
 
+# ---- Telegram notifications ----
+def send_telegram_notification(message: str, parse_mode: str = "HTML"):
+    """Send a notification to Telegram if configured."""
+    if rt.cfg is None:
+        return
+    
+    bot_token = rt.cfg.telegram_bot_token
+    chat_id = rt.cfg.telegram_chat_id
+    
+    if not bot_token or not chat_id:
+        return
+    
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": parse_mode,
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"[telegram] Failed to send notification: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"[telegram] Error sending notification: {e}")
+
+
 # ---- Global runtime state ----
 class RuntimeState:
     def __init__(self):
         self.lock = threading.Lock()
         self.manual_queue = deque()
         self.auto_queue = deque()
-        self.running_gpus = {}
-        self.auto_feed_enabled = True
+        self.running_gpus = {}  # {gpu_id: [exp_name1, exp_name2, ...]} - list of experiments per GPU
         self.used_idea_names = set()
         self.proxy_proc = None
         self.worker_running = False
         self.worker_thread = None
         self.cfg: ProjectConfig = None
+
+    def get_gpu_slots_used(self, gpu_id: int) -> int:
+        """Get number of slots currently used on a GPU."""
+        return len(self.running_gpus.get(gpu_id, []))
+
+    def get_available_gpu(self) -> int | None:
+        """Find a GPU with available slots. Returns GPU ID or None."""
+        slots_per_gpu = self.cfg.slots_per_gpu if self.cfg else 1
+        for g in (self.cfg.gpus if self.cfg else [0]):
+            if self.get_gpu_slots_used(g) < slots_per_gpu:
+                return g
+        return None
+
+    def add_experiment_to_gpu(self, gpu_id: int, exp_name: str):
+        """Add an experiment to a GPU's running list."""
+        if gpu_id not in self.running_gpus:
+            self.running_gpus[gpu_id] = []
+        if exp_name not in self.running_gpus[gpu_id]:
+            self.running_gpus[gpu_id].append(exp_name)
+
+    def remove_experiment_from_gpu(self, gpu_id: int, exp_name: str):
+        """Remove an experiment from a GPU's running list."""
+        if gpu_id in self.running_gpus:
+            try:
+                self.running_gpus[gpu_id].remove(exp_name)
+                if not self.running_gpus[gpu_id]:
+                    del self.running_gpus[gpu_id]
+            except ValueError:
+                pass
 
     def sync_running_from_docker(self):
         try:
@@ -77,6 +133,8 @@ class RuntimeState:
             active_containers = set(r.stdout.strip().split("\n")) if r.stdout.strip() else set()
             zombies_to_kill = []
             with self.lock:
+                # Rebuild running map from docker to drop stale entries.
+                rebuilt_running = {}
                 for cn in active_containers:
                     if not cn:
                         continue
@@ -85,14 +143,16 @@ class RuntimeState:
                         try:
                             gpu = int(parts[1])
                             exp_name = parts[0].replace("agent-", "", 1)
-                            if gpu not in self.running_gpus:
-                                exp = db.get_experiment(exp_name)
-                                if exp and exp.get("status") in ("completed", "failed", "killed", "cancelled"):
-                                    zombies_to_kill.append(cn)
-                                else:
-                                    self.running_gpus[gpu] = exp_name
+                            exp = db.get_experiment(exp_name)
+                            if exp and exp.get("status") in ("completed", "failed", "killed", "cancelled"):
+                                zombies_to_kill.append(cn)
+                            else:
+                                rebuilt_running.setdefault(gpu, [])
+                                if exp_name not in rebuilt_running[gpu]:
+                                    rebuilt_running[gpu].append(exp_name)
                         except ValueError:
                             pass
+                self.running_gpus = rebuilt_running
             for cn in zombies_to_kill:
                 try:
                     subprocess.run(DOCKER_CMD + ["kill", cn], capture_output=True, timeout=10)
@@ -103,6 +163,25 @@ class RuntimeState:
 
 
 rt = RuntimeState()
+
+
+def trim_auto_queue(max_size: int = MAX_AUTO_QUEUE_SIZE) -> int:
+    """Keep only first N auto-queued tasks. Manual queue is untouched."""
+    removed = []
+    with rt.lock:
+        while len(rt.auto_queue) > max_size:
+            removed.append(rt.auto_queue.pop())
+
+    for item in removed:
+        exp_id = item.get("id", "")
+        if not exp_id:
+            continue
+        db.update_experiment(exp_id, status="cancelled", notes=f"Auto queue trimmed to {max_size}")
+        db.add_log(exp_id, f"Removed from auto-queue (limit {max_size})", level="warning")
+
+    if removed:
+        orchestrator_log(f"Trimmed auto queue: removed {len(removed)} item(s), kept {max_size}")
+    return len(removed)
 
 
 # ---- Docker ----
@@ -139,7 +218,8 @@ def start_proxy():
     env["PROXY_PORT"] = str(rt.cfg.proxy_port)
     rt.proxy_proc = subprocess.Popen(
         [py, str(AWITUNE_DIR / "proxy.py")], cwd=str(AWITUNE_DIR), env=env,
-        stdout=open("/tmp/awitune_proxy.log", "a"), stderr=subprocess.STDOUT)
+        stdout=open("/tmp/awitune_proxy.log", "a"), stderr=subprocess.STDOUT,
+        start_new_session=True)  # Detach from terminal to prevent signal propagation
     time.sleep(2)
 
 
@@ -424,9 +504,10 @@ def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
         db.add_log(exp_name, f"Docker command: {' '.join(cmd[:10])}...")
         lp = exp_dir / "agent.log"
         events_file = out / "events.jsonl"
-        GRACE_PERIOD = 120
+        GRACE_PERIOD = 180  # 3 minutes to allow graceful shutdown
         with open(lp, "w") as lf:
-            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True)
+            # Use start_new_session=True to detach from terminal and prevent signal propagation
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
             deadline = time.time() + cfg.timeout_minutes * 60
             agent_done_at = None
             ec = None
@@ -436,10 +517,11 @@ def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
                     ec = ret
                     break
                 if time.time() > deadline:
-                    subprocess.run(DOCKER_CMD + ["kill", cn], capture_output=True)
-                    proc.wait(timeout=30)
+                    db.add_log(exp_name, "TIMEOUT — stopping container gracefully", level="error")
+                    # Use docker stop for graceful shutdown (SIGTERM then SIGKILL after 30s)
+                    subprocess.run(DOCKER_CMD + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
+                    proc.wait(timeout=60)
                     ec = -1
-                    db.add_log(exp_name, "TIMEOUT — container killed", level="error")
                     break
                 if agent_done_at is None and events_file.exists():
                     try:
@@ -454,9 +536,10 @@ def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
                     except Exception:
                         pass
                 if agent_done_at and time.time() - agent_done_at > GRACE_PERIOD:
-                    db.add_log(exp_name, "Container stuck after agent finished — killing", level="warning")
-                    subprocess.run(DOCKER_CMD + ["kill", cn], capture_output=True)
-                    proc.wait(timeout=30)
+                    db.add_log(exp_name, f"Container still running after {GRACE_PERIOD}s, stopping gracefully", level="warning")
+                    # Use docker stop for graceful shutdown
+                    subprocess.run(DOCKER_CMD + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
+                    proc.wait(timeout=60)
                     ec = proc.returncode
                     break
                 time.sleep(10)
@@ -477,9 +560,19 @@ def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
                              elapsed_min=round((time.time() - t0) / 60, 2),
                              notes=f"ERROR: {e}")
         db.add_log(exp_name, f"ERROR: {e}", level="error")
+        
+        # Send Telegram notification on failure
+        if rt.cfg.notify_on_failure:
+            send_telegram_notification(
+                f"❌ <b>Experiment FAILED</b>\n\n"
+                f"📊 Project: <b>{rt.cfg.name}</b>\n"
+                f"🧪 Experiment: <code>{exp_name}</code>\n"
+                f"⏱️ Time: {(time.time() - t0)/60:.1f} min\n"
+                f"⚠️ Error: <pre>{str(e)[:500]}</pre>"
+            )
     finally:
         with rt.lock:
-            rt.running_gpus.pop(gpu_id, None)
+            rt.remove_experiment_from_gpu(gpu_id, exp_name)
 
 
 def _finalize_analysis(exp_name, exp_dir, out, elapsed, ec):
@@ -516,6 +609,16 @@ def _finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp
         db.set_global("best_score", test)
         db.set_global("best_experiment", str(exp_dir / "workspace"))
         db.add_log(exp_name, f"★ {notes}", level="success")
+        
+        # Send Telegram notification on improvement
+        if rt.cfg.notify_on_improvement:
+            send_telegram_notification(
+                f"🎉 <b>NEW BEST SCORE!</b>\n\n"
+                f"📊 Project: <b>{rt.cfg.name}</b>\n"
+                f"📈 Score: <b>{test:.6f}</b> (was {best_score:.6f})\n"
+                f"🧪 Experiment: <code>{exp_name}</code>\n"
+                f"⏱️ Time: {elapsed/60:.1f} min"
+            )
 
     db.update_experiment(exp_name,
                          status="completed",
@@ -527,6 +630,18 @@ def _finalize_experiment_run(exp_name, exp_dir, out, elapsed, ec, best_score, lp
                          improved=1 if improved else 0,
                          notes=notes,
                          eval_json=json.dumps(ev))
+    
+    # Send Telegram notification on completion (if enabled)
+    if rt.cfg.notify_on_completion and not improved:
+        status_emoji = "✅" if ec == 0 else "❌"
+        send_telegram_notification(
+            f"{status_emoji} <b>Experiment completed</b>\n\n"
+            f"📊 Project: <b>{rt.cfg.name}</b>\n"
+            f"📈 Score: {test:.6f if test else 'N/A'}\n"
+            f"🧪 Experiment: <code>{exp_name}</code>\n"
+            f"⏱️ Time: {elapsed/60:.1f} min\n"
+            f"📝 Notes: {notes}"
+        )
 
 
 # ---- Auto-feeder ----
@@ -538,13 +653,9 @@ def _get_idea_feeder():
         return None
 
 
-def refill_auto_queue():
-    if not rt.auto_feed_enabled:
-        return
-    with rt.lock:
-        if len(rt.auto_queue) > 0:
-            return
-
+# ---- Worker ----
+def _collect_used_idea_names() -> set:
+    """Collect names of already used ideas from experiments and queues."""
     used_idea_names = set()
     all_exps = db.get_all_experiments(limit=2000)
     for e in all_exps:
@@ -564,78 +675,157 @@ def refill_auto_queue():
                 used_idea_names.add(item["idea_name"])
         rt.used_idea_names = used_idea_names
 
-    feeder = _get_idea_feeder()
-    if not feeder:
-        orchestrator_log("No feeder available")
-        return
-    
-    orchestrator_log(f"Getting ideas (used: {len(used_idea_names)})...")
-    unused = feeder.get_unused_prompts(used_idea_names)
-    orchestrator_log(f"Got {len(unused)} idea(s)")
-    if unused:
-        idea = unused[0]
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        eid = f"auto_{idea['name']}_{ts}"
-        base_exp = idea.get("base_experiment", "default")
+    return used_idea_names
+
+
+def _queue_idea(idea: dict, idx: int) -> bool:
+    """Queue a single idea. Returns True if successful."""
+    try:
+        if not isinstance(idea, dict):
+            orchestrator_log(f"Skipping invalid idea at index {idx}: not a dict")
+            return False
+
+        idea_name = str(idea.get("name") or "").strip()
+        idea_prompt = str(idea.get("prompt") or "").strip()
+        if not idea_name or not idea_prompt:
+            orchestrator_log(f"Skipping invalid idea at index {idx}: missing name or prompt")
+            return False
+
+        # Milliseconds + per-batch index to avoid ID collisions.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        eid = f"auto_{idea_name}_{ts}_{idx}"
+        base_exp = str(idea.get("base_experiment", "default") or "default")
         base_sol = resolve_base_solution(base_exp)
         parent = base_exp if base_exp and base_exp != "default" else ""
-        idea_task_type = idea.get("task_type", "experiment")
-        db.create_experiment(eid, prompt=idea["prompt"][:500], base_solution=base_sol,
-                             parent_experiment=parent, task_type=idea_task_type)
-        db.add_log(eid, f"Auto-queued {idea_task_type}: {idea['name']}")
-        orchestrator_log(f"Queued: {eid} ({idea_task_type}) - {idea.get('reasoning', '')[:100]}")
-        item = {"id": eid, "prompt": idea["prompt"], "base_solution": base_sol,
-                "idea_name": idea["name"], "auto": True,
-                "reference_code": idea.get("reference_code"),
-                "task_type": idea_task_type}
+        idea_task_type = str(idea.get("task_type", "experiment") or "experiment")
+        idea_reasoning = str(idea.get("reasoning", "") or "")
+
+        db.create_experiment(
+            eid,
+            prompt=idea_prompt[:500],
+            base_solution=base_sol,
+            parent_experiment=parent,
+            task_type=idea_task_type,
+        )
+        db.add_log(eid, f"Auto-queued {idea_task_type}: {idea_name}")
+        orchestrator_log(f"Queued: {eid} ({idea_task_type}) - {idea_reasoning[:100]}")
+        item = {
+            "id": eid,
+            "prompt": idea_prompt,
+            "base_solution": base_sol,
+            "idea_name": idea_name,
+            "auto": True,
+            "reference_code": idea.get("reference_code"),
+            "task_type": idea_task_type,
+        }
         with rt.lock:
             rt.auto_queue.append(item)
+        return True
+    except Exception as e:
+        orchestrator_log(f"Failed to queue idea at index {idx}: {e}")
+        return False
 
 
-# ---- Worker ----
 def worker_loop():
+    """Main worker loop: syncs Docker state, processes queues, and auto-feeds ideas."""
+    last_sync_at = 0.0
     while rt.worker_running:
-        item = None
-        with rt.lock:
-            if rt.manual_queue:
-                item = rt.manual_queue.popleft()
-            elif rt.auto_queue:
-                item = rt.auto_queue.popleft()
+        try:
+            now = time.time()
+            if now - last_sync_at >= 15:
+                rt.sync_running_from_docker()
+                last_sync_at = now
 
-        if item is None:
-            refill_auto_queue()
-            time.sleep(2)
-            continue
+            # Try to start as many experiments as we have available slots
+            started_any = False
 
-        with rt.lock:
-            gpu = None
-            used = set(rt.running_gpus.keys())
-            for g in rt.cfg.gpus:
-                if g not in used:
-                    gpu = g
+            while True:
+                item = None
+                with rt.lock:
+                    if rt.manual_queue:
+                        item = rt.manual_queue.popleft()
+                    elif rt.auto_queue:
+                        item = rt.auto_queue.popleft()
+
+                if item is None:
                     break
-            if gpu is None:
-                if item.get("auto"):
-                    rt.auto_queue.appendleft(item)
-                else:
-                    rt.manual_queue.appendleft(item)
+
+                with rt.lock:
+                    gpu = rt.get_available_gpu()
+                    if gpu is None:
+                        # No slots available, put item back
+                        if item.get("auto"):
+                            rt.auto_queue.appendleft(item)
+                        else:
+                            rt.manual_queue.appendleft(item)
+                        break  # No more slots, stop trying
+                    else:
+                        rt.add_experiment_to_gpu(gpu, item["id"])
+
+                # Start the experiment thread
+                threading.Thread(
+                    target=run_agent_in_thread,
+                    args=(item["id"], item.get("prompt", ""), item.get("base_solution", ""), gpu),
+                    kwargs={
+                        "reference_code": item.get("reference_code"),
+                        "task_type": item.get("task_type", "experiment"),
+                    },
+                    daemon=True
+                ).start()
+                started_any = True
+                time.sleep(0.5)  # Small delay between starts to avoid race conditions
+
+            # Auto-feed: refill queue if needed
+            if not started_any:
+                trim_auto_queue(MAX_AUTO_QUEUE_SIZE)
+                
+                with rt.lock:
+                    if len(rt.auto_queue) > 0:
+                        time.sleep(2)
+                        continue
+
+                used_idea_names = _collect_used_idea_names()
+
+                feeder = _get_idea_feeder()
+                if not feeder:
+                    orchestrator_log("No feeder available")
+                    time.sleep(2)
+                    continue
+
+                # Calculate how many slots we need to fill
+                slots_per_gpu = rt.cfg.slots_per_gpu if rt.cfg else 1
+                total_slots = len(rt.cfg.gpus) * slots_per_gpu if rt.cfg else 1
+
+                with rt.lock:
+                    running_count = sum(len(exps) for exps in rt.running_gpus.values())
+                    queued_auto_count = len(rt.auto_queue)
+                    queued_manual_count = len(rt.manual_queue)
+                    needed = total_slots - running_count - queued_auto_count - queued_manual_count
+                    max_auto_to_add = MAX_AUTO_QUEUE_SIZE - queued_auto_count
+                    needed = min(needed, max_auto_to_add)
+
+                if needed <= 0:
+                    time.sleep(2)
+                    continue
+
+                orchestrator_log(f"Getting ideas (used: {len(used_idea_names)}, need {needed})...")
+                unused = feeder.get_unused_prompts(used_idea_names, limit=needed)
+                orchestrator_log(f"Got {len(unused)} idea(s)")
+
+                queued_now = 0
+                for idx, idea in enumerate(unused):
+                    if _queue_idea(idea, idx):
+                        queued_now += 1
+
+                if queued_now:
+                    orchestrator_log(f"Queued total: {queued_now}/{len(unused)}")
+
+                time.sleep(2)
             else:
-                rt.running_gpus[gpu] = item["id"]
-
-        if gpu is None:
+                time.sleep(1)  # Brief pause before next iteration
+        except Exception as e:
+            orchestrator_log(f"Worker loop error (continuing): {e}")
             time.sleep(2)
-            continue
-
-        threading.Thread(
-            target=run_agent_in_thread,
-            args=(item["id"], item.get("prompt", ""), item.get("base_solution", ""), gpu),
-            kwargs={
-                "reference_code": item.get("reference_code"),
-                "task_type": item.get("task_type", "experiment"),
-            },
-            daemon=True
-        ).start()
-        time.sleep(1)
 
 
 def start_worker():
@@ -659,7 +849,7 @@ def index():
 
 @app.route("/api/state")
 def api_state():
-    rt.sync_running_from_docker()
+    # Don't sync on every request - only at startup via cli.py
     direction = rt.cfg.best_score_sort_key()
     stats = db.get_stats(direction)
     exps = db.get_all_experiments(limit=2000)
@@ -679,11 +869,21 @@ def api_state():
             return (3, "")
     exps.sort(key=_exp_sort_key)
 
+    queue_items = []
+    with rt.lock:
+        raw_queue = list(rt.manual_queue) + [{"auto": True, **i} for i in rt.auto_queue]
+    for q in raw_queue:
+        qid = q.get("id", "")
+        display_name = q.get("name") or q.get("idea_name") or qid
+        queue_items.append({
+            **q,
+            "name": display_name,
+        })
+
     return jsonify({
         "project_name": rt.cfg.name,
         "metric": rt.cfg.test_metric_key,
-        "queue": list(rt.manual_queue) + [{"auto": True, **i} for i in rt.auto_queue],
-        "auto_feed_enabled": rt.auto_feed_enabled,
+        "queue": queue_items,
         "auto_queue_size": len(rt.auto_queue),
         "ideas_total": -1,  # No longer using static ideas
         "ideas_used": len(rt.used_idea_names),
@@ -692,6 +892,8 @@ def api_state():
         "best_score": stats.get("best_score", 0) or 0,
         "best_experiment": stats.get("best_experiment", ""),
         "available_gpus": rt.cfg.gpus,
+        "slots_per_gpu": rt.cfg.slots_per_gpu,
+        "used_slots": {str(k): len(v) for k, v in rt.running_gpus.items()},
         "used_gpus": list(rt.running_gpus.keys()),
         "worker_running": rt.worker_running,
         "proxy_running": rt.proxy_proc is not None and rt.proxy_proc.poll() is None,
@@ -770,12 +972,6 @@ def api_proxy_start():
 def api_proxy_stop():
     stop_proxy()
     return jsonify({"status": "stopped"})
-
-
-@app.route("/api/autofeed/toggle", methods=["POST"])
-def api_autofeed_toggle():
-    rt.auto_feed_enabled = not rt.auto_feed_enabled
-    return jsonify({"auto_feed_enabled": rt.auto_feed_enabled})
 
 
 @app.route("/api/log/<exp_name>/agent")
@@ -1044,16 +1240,33 @@ def api_tasks(exp_name):
         try:
             tasks_dir = _find_claude_tasks_dir(cn)
             if tasks_dir:
-                r = subprocess.run(DOCKER_CMD + ["exec", cn, "ls", "-1", tasks_dir],
-                                   capture_output=True, text=True, timeout=5)
+                # Get list of .output files first
+                r = subprocess.run(DOCKER_CMD + ["exec", cn, "sh", "-c",
+                                   f"for f in {tasks_dir}/*.output; do stat -c '%n|%s|%Y' \"$f\"; done"],
+                                   capture_output=True, text=True, timeout=10)
                 if r.returncode == 0:
-                    for fname in r.stdout.strip().split("\n"):
-                        fname = fname.strip()
-                        if fname and fname.endswith(".output"):
-                            tid = fname.replace(".output", "")
-                            task_files.append(tid)
-                            if tid not in tasks:
-                                tasks[tid] = {"id": tid, "description": "background task", "turn": "?"}
+                    for line in r.stdout.strip().split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            parts = line.split("|")
+                            if len(parts) >= 3:
+                                fname = parts[0]
+                                tid = fname.replace(".output", "").split("/")[-1]
+                                size = parts[1]
+                                timestamp = int(parts[2])
+                                # Convert to local time (Moscow UTC+3)
+                                utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                                # Moscow timezone is UTC+3
+                                moscow_tz = timezone(timedelta(hours=3))
+                                local_dt = utc_dt.astimezone(moscow_tz)
+                                modified = local_dt.strftime("%b %d %H:%M")
+                                task_files.append({"id": tid, "size": size, "modified": modified, "timestamp": timestamp})
+                                if tid not in tasks:
+                                    tasks[tid] = {"id": tid, "description": "background task", "turn": "?"}
+                        except (ValueError, IndexError):
+                            pass
         except Exception:
             pass
     return jsonify({"tasks": sorted(tasks.values(), key=lambda t: str(t.get("turn", ""))),
@@ -1121,8 +1334,8 @@ def api_restart(exp_name):
             subprocess.run(DOCKER_CMD + ["kill", f"agent-{exp_name}-gpu{gpu}"],
                            capture_output=True, timeout=5)
         with rt.lock:
-            for k in [k for k, v in rt.running_gpus.items() if v == exp_name]:
-                del rt.running_gpus[k]
+            for gpu_id in list(rt.running_gpus.keys()):
+                rt.remove_experiment_from_gpu(gpu_id, exp_name)
         exp_dir = rt.cfg.experiments_dir / exp_name
         for subdir in ["output", "workspace"]:
             d = exp_dir / subdir
@@ -1154,8 +1367,8 @@ def api_delete(exp_name):
             subprocess.run(DOCKER_CMD + ["kill", f"agent-{exp_name}-gpu{gpu}"],
                            capture_output=True, timeout=5)
         with rt.lock:
-            for k in [k for k, v in rt.running_gpus.items() if v == exp_name]:
-                del rt.running_gpus[k]
+            for gpu_id in list(rt.running_gpus.keys()):
+                rt.remove_experiment_from_gpu(gpu_id, exp_name)
         db.delete_experiment(exp_name)
         exp_dir = rt.cfg.experiments_dir / exp_name
         if exp_dir.exists():
@@ -1229,6 +1442,18 @@ def _check_agent_finished(events_file):
         return False
 
 
+def _get_events_file_age(events_file: Path) -> float:
+    """Get age of events.jsonl in seconds. Returns infinity if file doesn't exist."""
+    if not events_file.exists():
+        return float('inf')
+    try:
+        import os
+        mtime = os.path.getmtime(events_file)
+        return time.time() - mtime
+    except Exception:
+        return float('inf')
+
+
 def _find_container_name(exp_name, active_containers):
     for cn in active_containers:
         if exp_name in cn:
@@ -1270,11 +1495,25 @@ def _finalize_experiment(exp_name, best_score):
         db.set_global("best_score", test)
         db.set_global("best_experiment", str(exp_dir / "workspace"))
 
-    has_output = out.exists() and any(out.iterdir()) if out.exists() else False
-    status = "completed" if has_output else "failed"
+    submission_path = out / "submission.parquet"
+    has_submission = submission_path.exists()
+    has_eval = bool(ev)
+    has_result_event = _check_agent_finished(out / "events.jsonl")
+    # A recovered run is considered successful only when it produced measurable outputs.
+    status = "completed" if (has_eval or has_submission) else "failed"
+    if status == "failed":
+        if has_result_event:
+            notes = "recovered after restart (agent finished but no eval/submission)"
+        else:
+            notes = "recovered after restart (stuck or interrupted before result/eval)"
+
+    recovered_exit_code = exp.get("exit_code") if exp else None
+    if status == "failed" and recovered_exit_code is None:
+        recovered_exit_code = -3
     db.update_experiment(exp_name,
                          status=status,
                          finished_at=datetime.now().isoformat(),
+                         exit_code=recovered_exit_code,
                          elapsed_min=elapsed_min,
                          test_score=test if test else None,
                          val_score=val if val else None,
@@ -1286,10 +1525,11 @@ def _finalize_experiment(exp_name, best_score):
 
 
 def _monitor_orphaned_container(exp_name, container_name, gpu_id):
-    GRACE_PERIOD = 120
+    STUCK_THRESHOLD = 600  # 10 minutes without events.jsonl update = stuck
     events_file = rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
-    agent_done_at = None
+    agent_done_logged = False
     db.add_log(exp_name, f"Resumed monitoring (container {container_name})")
+    
     while True:
         try:
             r = subprocess.run(
@@ -1299,18 +1539,24 @@ def _monitor_orphaned_container(exp_name, container_name, gpu_id):
                 break
         except Exception:
             break
-        if agent_done_at is None and _check_agent_finished(events_file):
-            agent_done_at = time.time()
-        if agent_done_at and time.time() - agent_done_at > GRACE_PERIOD:
-            subprocess.run(DOCKER_CMD + ["kill", container_name], capture_output=True)
-            break
+        
+        # Check if agent finished (has "result" in events.jsonl)
+        if not agent_done_logged and _check_agent_finished(events_file):
+            agent_done_logged = True
+            db.add_log(exp_name, "Agent finished (found 'result' in events.jsonl), waiting for container to exit...")
+        
+        # Check if container is stuck (no events.jsonl updates for too long)
+        events_age = _get_events_file_age(events_file)
+        if events_age > STUCK_THRESHOLD and not agent_done_logged:
+            db.add_log(exp_name, f"Container appears stuck (no events.jsonl updates for {events_age:.0f}s)", level="warning")
+        
         time.sleep(10)
 
     direction = rt.cfg.best_score_sort_key()
     best_score = db.get_stats(direction).get("best_score", 0) or 0
     _finalize_experiment(exp_name, best_score)
     with rt.lock:
-        rt.running_gpus.pop(gpu_id, None)
+        rt.remove_experiment_from_gpu(gpu_id, exp_name)
 
 
 def recover_orphaned_experiments():
@@ -1333,19 +1579,13 @@ def recover_orphaned_experiments():
         gpu_id = exp.get("gpu_id")
         cn = _find_container_name(exp_name, active_containers)
         if cn:
-            events_file = rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
-            if _check_agent_finished(events_file):
-                subprocess.run(DOCKER_CMD + ["kill", cn], capture_output=True)
-                time.sleep(2)
-                _finalize_experiment(exp_name, best_score)
-                recovered += 1
-            else:
-                if gpu_id is not None:
-                    with rt.lock:
-                        rt.running_gpus[gpu_id] = exp_name
-                threading.Thread(target=_monitor_orphaned_container,
-                                 args=(exp_name, cn, gpu_id), daemon=True).start()
-                monitored += 1
+            if gpu_id is not None:
+                with rt.lock:
+                    rt.add_experiment_to_gpu(gpu_id, exp_name)
+            db.add_log(exp_name, f"Resuming monitoring for orphaned experiment on GPU {gpu_id}")
+            threading.Thread(target=_monitor_orphaned_container,
+                             args=(exp_name, cn, gpu_id), daemon=True).start()
+            monitored += 1
         else:
             _finalize_experiment(exp_name, best_score)
             recovered += 1

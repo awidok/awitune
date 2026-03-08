@@ -56,7 +56,6 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 <span id="ps"></span><span id="ws"></span><span id="afs"></span>
 <button class="bt" onclick="tw()" id="wb">Start Worker</button>
 <button class="bt" onclick="tp()" id="pb">Start Proxy</button>
-<button class="bt" onclick="taf()" id="afb">Auto-Feed</button>
 <a href="/graph" class="bt" style="text-decoration:none;font-size:10px">📊 Graph</a>
 <button class="bt" onclick="showOrchestratorLog()" style="font-size:10px">🧠 Planner</button>
 <button class="bt" onclick="showProxyLog()" style="font-size:10px">📋 Proxy</button>
@@ -130,32 +129,35 @@ async function rf(){
         if(d.proxy_running){psEl.innerHTML='<span class="dot g"></span> Proxy';pbEl.textContent='Stop Proxy';pbEl.className='bt r'}
         else{psEl.innerHTML='<span class="dot r"></span> Proxy';pbEl.textContent='Start Proxy';pbEl.className='bt g'}
 
-        // Auto-feed status
-        const afsEl=document.getElementById('afs'),afbEl=document.getElementById('afb');
-        if(d.auto_feed_enabled){
-            afsEl.innerHTML=`<span class="dot g"></span> Ideas ${d.ideas_used||0}/${d.ideas_total||0}`;
-            afbEl.textContent='Stop Auto-Feed';afbEl.className='bt r';
+        // Ideas status (auto-feed is now part of worker)
+        const afsEl=document.getElementById('afs');
+        if(d.worker_running){
+            afsEl.innerHTML=`<span class="dot g"></span> Ideas ${d.ideas_used||0}`;
         } else {
-            afsEl.innerHTML='<span class="dot r"></span> Auto-Feed OFF';
-            afbEl.textContent='Start Auto-Feed';afbEl.className='bt g';
+            afsEl.innerHTML='<span class="dot r"></span> Ideas (worker off)';
         }
 
         // GPUs
-        document.getElementById('gpuc').textContent=`${d.available_gpus.length-d.used_gpus.length}/${d.available_gpus.length} free`;
+        const totalSlots=(d.available_gpus?.length||0)*(d.slots_per_gpu||1);
+        const usedSlots=Object.values(d.used_slots||{}).reduce((a,b)=>a+(b||0),0);
+        document.getElementById('gpuc').textContent=`${Math.max(0,totalSlots-usedSlots)}/${totalSlots} free`;
         document.getElementById('gbar').innerHTML=d.available_gpus.map(g=>{
-            const busy=d.used_gpus.includes(g);
-            const info=busy?d.running[String(g)]:null;
-            return `<div class="gc ${busy?'bu':'fr'}">GPU ${g}${busy?'<br>'+(info?.name||'').slice(0,12):''}</div>`;
+            const gpuKey=String(g);
+            const used=(d.used_slots&&d.used_slots[gpuKey])||0;
+            const slots=d.slots_per_gpu||1;
+            const busy=used>0;
+            return `<div class="gc ${busy?'bu':'fr'}">GPU ${g}<br>${used}/${slots}</div>`;
         }).join('');
 
         // Queue
         if(d.queue.length>0){
             document.getElementById('qc').style.display='';
             document.getElementById('qn').textContent=`(${d.queue.length})`;
-            document.getElementById('ql').innerHTML=d.queue.map((q,i)=>
-                `<div class="qi"><span>${q.name}</span><span class="pr">${q.prompt||'default'}</span>
+            document.getElementById('ql').innerHTML=d.queue.map((q,i)=>{
+                const qname=q.name||q.idea_name||q.id||'queued_task';
+                return `<div class="qi"><span>${qname}</span><span class="pr">${q.prompt||'default'}</span>
                 <button class="bt" onclick="rq(${i})" style="padding:2px 6px">✕</button></div>`
-            ).join('');
+            }).join('');
         } else {
             document.getElementById('qc').style.display='none';
         }
@@ -265,10 +267,23 @@ async function lt(){
             if(!d.tasks||d.tasks.length===0){
                 lc.innerHTML='<div style="padding:10px;color:#8b949e">No background tasks found</div>';
             } else {
-                lc.innerHTML=d.tasks.map(t=>{
-                    const hasFile=d.task_files.includes(t.id);
-                    const statusIcon=hasFile?'📄':'⏳';
-                    const clickable=hasFile||d.container?`onclick="vtask('${sel}','${t.id}')" style="cursor:pointer"`:'';
+                // Sort task_files by timestamp (newest first)
+                const taskFiles = d.task_files || [];
+                const sortedFiles = [...taskFiles].sort((a, b) => {
+                    return (b.timestamp || 0) - (a.timestamp || 0);
+                });
+                lc.innerHTML=sortedFiles.map(tf=>{
+                    const task = d.tasks.find(t => t.id === tf.id) || {id: tf.id, turn: '?'};
+                    const statusIcon='📄';
+                    const clickable=d.container?`onclick="vtask('${sel}','${tf.id}')" style="cursor:pointer"`:'';
+                    const sizeStr = tf.size ? (parseInt(tf.size) > 1024 ? `${(parseInt(tf.size)/1024).toFixed(1)}KB` : `${tf.size}B`) : '?';
+                    return `<div class="fi" ${clickable}>
+                        <span>${statusIcon} ${tf.id}</span>
+                        <span class="sz">${tf.modified || '?'} · ${sizeStr}</span>
+                    </div>`;
+                }).join('') || d.tasks.map(t=>{
+                    const statusIcon='⏳';
+                    const clickable=d.container?`onclick="vtask('${sel}','${t.id}')" style="cursor:pointer"`:'';
                     return `<div class="fi" ${clickable}>
                         <span>${statusIcon} ${t.id}</span>
                         <span class="sz">Turn ${t.turn}</span>
@@ -421,11 +436,6 @@ async function de(name){
     if(!confirm('Delete experiment '+name+'? This cannot be undone.'))return;
     await fetch('/api/delete/'+name,{method:'POST'});
     if(sel===name)sel=null;
-    rf();
-}
-
-async function taf(){
-    await fetch('/api/autofeed/toggle',{method:'POST'});
     rf();
 }
 

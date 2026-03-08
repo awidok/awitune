@@ -231,8 +231,10 @@ def build_user_prompt(ctx: dict, count: int) -> str:
     return "\n".join(parts)
 
 
-def call_openai_with_tools(system: str, user: str, temperature: float = 0.7) -> str:
-    """Call OpenAI API with function calling support."""
+def call_openai_with_tools(system: str, user: str, temperature: float = 0.7, max_retries: int = 3) -> str:
+    """Call OpenAI API with function calling support with retry logic."""
+    import time
+    
     url = f"{OPENAI_API_BASE}/chat/completions"
     
     messages = [
@@ -256,9 +258,44 @@ def call_openai_with_tools(system: str, user: str, temperature: float = 0.7) -> 
         }
         
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        response = requests.post(url, json=payload, headers=headers, timeout=300, verify=False)
-        response.raise_for_status()
-        data = response.json()
+        
+        # Retry logic for transient errors
+        last_error = None
+        for retry_attempt in range(max_retries):
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=300, verify=False)
+                response.raise_for_status()
+                data = response.json()
+                break  # Success, exit retry loop
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                if retry_attempt < max_retries - 1:
+                    wait_time = 2 ** retry_attempt
+                    print(f"  Timeout, retrying in {wait_time}s (attempt {retry_attempt + 1}/{max_retries})...", flush=True)
+                    time.sleep(wait_time)
+                    continue
+                print(f"  ERROR: Timeout after {max_retries} retries", flush=True)
+                raise
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                status_code = e.response.status_code if e.response else 0
+                # Retry on rate limit and server errors
+                if status_code in (429, 502, 503, 504) and retry_attempt < max_retries - 1:
+                    wait_time = 2 ** retry_attempt
+                    print(f"  HTTP {status_code}, retrying in {wait_time}s (attempt {retry_attempt + 1}/{max_retries})...", flush=True)
+                    time.sleep(wait_time)
+                    continue
+                print(f"  ERROR: HTTP {status_code} after {retry_attempt + 1} attempt(s)", flush=True)
+                raise
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                if retry_attempt < max_retries - 1:
+                    wait_time = 2 ** retry_attempt
+                    print(f"  Connection error, retrying in {wait_time}s (attempt {retry_attempt + 1}/{max_retries})...", flush=True)
+                    time.sleep(wait_time)
+                    continue
+                print(f"  ERROR: Connection error after {max_retries} retries", flush=True)
+                raise
         
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
