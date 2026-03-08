@@ -130,10 +130,31 @@ Example format:
 
 ## Critical Rules
 
+### Single-Run Policy (MANDATORY)
+- In one orchestrator experiment, you must complete **at most one full training run** that reaches normal end and writes outputs.
+- You may fix code/runtime errors and rerun **only until the first successful full run**.
+- After the first successful full run:
+  1. verify output files,
+  2. write `report.md`,
+  3. stop.
+- Do **not** run additional "try another config", "one more training", "ablation", or "quick comparison" loops in the same experiment.
+- The decision to start another experiment belongs to the orchestrator, not to this agent run.
+
 ### Time & Resource Constraints
 - Training the baseline takes **~2-3 hours**. Do not make the architecture significantly heavier.
 - You have **1 GPU**. Avoid dramatically increasing model dimensions or batch sizes.
 - The data is READ-ONLY in `/app/data/`. Write outputs to `/app/output/`.
+
+### GPU Utilization & Efficiency (MANDATORY)
+- Prefer changes that improve **quality per GPU-hour**, not just absolute quality.
+- Keep GPU busy during training: avoid obvious input pipeline stalls, unnecessary CPU bottlenecks, and long idle waits.
+- Favor compute-efficient techniques that preserve or improve quality:
+  - mixed precision (when stable),
+  - efficient dataloading / preprocessing,
+  - reasonable batch sizing for high GPU occupancy without OOM,
+  - avoiding redundant forward passes and repeated full-dataset evaluations.
+- Be mindful of memory and runtime so many experiments can run in parallel on shared infrastructure.
+- If two options are similar in expected quality, choose the one with lower runtime / memory footprint.
 
 ### Code Change Rules
 - **MODIFY the existing `run.py`** — do NOT rewrite it from scratch.

@@ -64,6 +64,77 @@ class OrchestratorService:
             subprocess.run(["chmod", "-R", "u+rwX", str(path)], capture_output=True, timeout=30)
             shutil.rmtree(path, ignore_errors=True)
 
+    def _cleanup_post_result_processes(self, exp_name: str, container_name: str) -> bool:
+        """Stop known background tail/watch loops that can keep container alive after result."""
+        cleanup_cmd = (
+            "pids=$(ps -eo pid,args | awk '"
+            "/\\/home\\/agent\\/\\.claude\\/shell-snapshots\\/.*tasks\\/.*\\.output/ {print $1}; "
+            "/tail -f \\/tmp\\/claude-.*\\/-app-workspace\\/tasks\\/.*\\.output/ {print $1}; "
+            "/while true; do clear; tail -n 100 \\/tmp\\/claude-.*\\/-app-workspace\\/tasks\\/.*\\.output; sleep 300; done/ {print $1}; "
+            "/^ *[0-9]+ sleep 300$/ {print $1}' | sort -u); "
+            "if [ -n \"$pids\" ]; then kill $pids >/dev/null 2>&1; echo \"$pids\"; exit 0; fi; "
+            "exit 3"
+        )
+        try:
+            result = subprocess.run(
+                self.docker_cmd + ["exec", container_name, "sh", "-c", cleanup_cmd],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                killed = " ".join(result.stdout.split())
+                db.add_log(exp_name, f"Post-result cleanup: stopped background processes [{killed}]")
+                return True
+        except Exception as exc:
+            db.add_log(exp_name, f"Post-result cleanup failed: {exc}", level="warning")
+        return False
+
+    def _terminate_post_result_agent(self, exp_name: str, container_name: str) -> bool:
+        """Gracefully terminate claude process after result if it lingers."""
+        try:
+            result = subprocess.run(
+                self.docker_cmd + ["exec", container_name, "sh", "-c", "pkill -TERM -x claude"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                db.add_log(exp_name, "Post-result cleanup: sent TERM to lingering claude process")
+                return True
+        except Exception as exc:
+            db.add_log(exp_name, f"Post-result claude TERM failed: {exc}", level="warning")
+        return False
+
+    def _force_finish_container_after_result(self, exp_name: str, container_name: str):
+        """If result is already produced, free resources by finishing container now."""
+        db.add_log(exp_name, "Result is ready but container still alive; stopping container to free resources", level="warning")
+        try:
+            subprocess.run(
+                self.docker_cmd + ["stop", "-t", "30", container_name],
+                capture_output=True,
+                timeout=60,
+            )
+        except Exception as exc:
+            db.add_log(exp_name, f"Container stop after result failed: {exc}", level="warning")
+
+        try:
+            state = subprocess.run(
+                self.docker_cmd + ["inspect", container_name, "--format", "{{.State.Running}}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if state.stdout.strip() == "true":
+                subprocess.run(
+                    self.docker_cmd + ["kill", container_name],
+                    capture_output=True,
+                    timeout=15,
+                )
+                db.add_log(exp_name, "Container kill after result applied (stop was insufficient)", level="warning")
+        except Exception as exc:
+            db.add_log(exp_name, f"Container kill after result failed: {exc}", level="warning")
+
     def run_agent_in_thread(self, exp_name, prompt, base_solution, gpu_id, reference_code=None, task_type="experiment"):
         cfg = self.rt.cfg
         exp_dir = cfg.experiments_dir / exp_name
@@ -157,6 +228,8 @@ class OrchestratorService:
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
                 deadline = time.time() + cfg.timeout_minutes * 60
                 agent_done_at = None
+                last_cleanup_at = 0.0
+                agent_term_sent = False
                 ec = None
                 while True:
                     ret = proc.poll()
@@ -172,9 +245,15 @@ class OrchestratorService:
                     if agent_done_at is None and has_result_event(events_file):
                         agent_done_at = time.time()
                         db.add_log(exp_name, "Agent finished, waiting for container to exit...")
+                        if self._cleanup_post_result_processes(exp_name, cn):
+                            last_cleanup_at = time.time()
+                    if agent_done_at and (time.time() - last_cleanup_at) >= 30:
+                        if self._cleanup_post_result_processes(exp_name, cn):
+                            last_cleanup_at = time.time()
+                    if agent_done_at and not agent_term_sent and (time.time() - agent_done_at) > grace_period:
+                        agent_term_sent = self._terminate_post_result_agent(exp_name, cn)
                     if agent_done_at and time.time() - agent_done_at > grace_period:
-                        db.add_log(exp_name, f"Container still running after {grace_period}s, stopping gracefully", level="warning")
-                        subprocess.run(self.docker_cmd + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
+                        self._force_finish_container_after_result(exp_name, cn)
                         proc.wait(timeout=60)
                         ec = proc.returncode
                         break
@@ -461,8 +540,12 @@ class OrchestratorService:
 
     def _monitor_orphaned_container(self, exp_name, container_name, gpu_id):
         stuck_threshold = 600
+        post_result_grace = 180
         events_file = self.rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
         agent_done_logged = False
+        agent_done_at = None
+        last_cleanup_at = 0.0
+        agent_term_sent = False
         db.add_log(exp_name, f"Resumed monitoring (container {container_name})")
 
         while True:
@@ -480,7 +563,17 @@ class OrchestratorService:
 
             if not agent_done_logged and has_result_event(events_file):
                 agent_done_logged = True
+                agent_done_at = time.time()
                 db.add_log(exp_name, "Agent finished (found 'result' in events.jsonl), waiting for container to exit...")
+                if self._cleanup_post_result_processes(exp_name, container_name):
+                    last_cleanup_at = time.time()
+            if agent_done_logged and (time.time() - last_cleanup_at) >= 30:
+                if self._cleanup_post_result_processes(exp_name, container_name):
+                    last_cleanup_at = time.time()
+            if agent_done_at and not agent_term_sent and (time.time() - agent_done_at) > post_result_grace:
+                agent_term_sent = self._terminate_post_result_agent(exp_name, container_name)
+            if agent_done_at and (time.time() - agent_done_at) > post_result_grace:
+                self._force_finish_container_after_result(exp_name, container_name)
 
             events_age = self._get_events_file_age(events_file)
             if events_age > stuck_threshold and not agent_done_logged:

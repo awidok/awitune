@@ -7,8 +7,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from . import db
-from .config import ProjectConfig
+from .. import db
+from ..config import ProjectConfig
 
 ORCHESTRATOR_LOG_PATH = Path("/tmp/awitune_orchestrator.log")
 MAX_AUTO_QUEUE_SIZE = 5
