@@ -18,8 +18,8 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 from flask_cors import CORS
 
-from . import db
-from .config import ProjectConfig
+from .lib import db
+from .lib.config import ProjectConfig
 
 load_dotenv()
 

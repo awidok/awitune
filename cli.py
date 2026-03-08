@@ -10,7 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import load_config
+from .lib.config import load_config
 
 
 def cmd_reset(args):
@@ -46,9 +46,10 @@ def cmd_run(args):
     if args.gpus:
         cfg.gpus = [int(g) for g in args.gpus.split(",")]
 
-    from . import db, idea_feeder, generate_ideas
+    from . import idea_feeder, generate_ideas
+    from .lib import db
     from .dashboard import app, init_app, start_proxy, start_worker, rt, recover_orphaned_experiments
-    from .orchestrator_tools import configure as configure_tools
+    from .lib.orchestrator_tools import configure as configure_tools
 
     init_app(cfg)
 
