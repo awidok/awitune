@@ -445,6 +445,37 @@ def _extract_metrics(ev: dict) -> tuple[float, float]:
     return test, val
 
 
+def _has_result_event(events_file: Path, tail_bytes: int = 65536) -> bool:
+    """Best-effort detection of a terminal 'result' event in events.jsonl."""
+    if not events_file.exists():
+        return False
+    try:
+        with open(events_file, "rb") as ef:
+            ef.seek(0, 2)
+            sz = ef.tell()
+            ef.seek(max(0, sz - tail_bytes))
+            tail = ef.read().decode("utf-8", errors="ignore")
+
+        # Fast path: support both compact JSON and JSON with spaces.
+        if re.search(r'"type"\s*:\s*"result"', tail):
+            return True
+
+        # Fallback: parse JSONL lines when formatting is unusual.
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                return True
+    except Exception:
+        return False
+    return False
+
+
 # ---- Agent runner ----
 def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
                         reference_code=None, task_type="experiment"):
@@ -523,18 +554,9 @@ def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
                     proc.wait(timeout=60)
                     ec = -1
                     break
-                if agent_done_at is None and events_file.exists():
-                    try:
-                        with open(events_file, "rb") as ef:
-                            ef.seek(0, 2)
-                            sz = ef.tell()
-                            ef.seek(max(0, sz - 8192))
-                            tail = ef.read().decode("utf-8", errors="ignore")
-                        if '"type":"result"' in tail:
-                            agent_done_at = time.time()
-                            db.add_log(exp_name, "Agent finished, waiting for container to exit...")
-                    except Exception:
-                        pass
+                if agent_done_at is None and _has_result_event(events_file):
+                    agent_done_at = time.time()
+                    db.add_log(exp_name, "Agent finished, waiting for container to exit...")
                 if agent_done_at and time.time() - agent_done_at > GRACE_PERIOD:
                     db.add_log(exp_name, f"Container still running after {GRACE_PERIOD}s, stopping gracefully", level="warning")
                     # Use docker stop for graceful shutdown
@@ -1428,17 +1450,7 @@ def api_analyst_report(name):
 # ---- Orphan recovery ----
 
 def _check_agent_finished(events_file):
-    if not events_file.exists():
-        return False
-    try:
-        with open(events_file, "rb") as ef:
-            ef.seek(0, 2)
-            sz = ef.tell()
-            ef.seek(max(0, sz - 8192))
-            tail = ef.read().decode("utf-8", errors="ignore")
-        return '"type":"result"' in tail
-    except Exception:
-        return False
+    return _has_result_event(events_file)
 
 
 def _get_events_file_age(events_file: Path) -> float:
