@@ -12,29 +12,18 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 from flask_cors import CORS
 
-from .lib import db
-from .lib.config import ProjectConfig
-from .lib.dashboard_proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
-from .lib.dashboard_runtime import (
+from .. import db
+from ..config import ProjectConfig
+from ..dashboard_proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
+from ..dashboard_runtime import (
     MAX_AUTO_QUEUE_SIZE,
     ORCHESTRATOR_LOG_PATH,
     RuntimeState,
     get_docker_cmd,
     orchestrator_log,
 )
-from .lib.orchestrator_eval import (
-    extract_metrics as eval_extract_metrics,
-    has_result_event as eval_has_result_event,
-    read_eval_results as eval_read_results,
-    run_evaluate as eval_run_evaluate,
-)
-from .lib.orchestrator_queue import (
-    collect_used_idea_names as queue_collect_used_idea_names,
-    queue_idea as queue_queue_idea,
-)
-from .lib.notifications import send_telegram_notification as notify_telegram
-from .lib.orchestrator_service import OrchestratorService
-from .lib.orchestrator.management import (
+from ..notifications import send_telegram_notification as notify_telegram
+from ..orchestrator.management import (
     delete_experiment as orch_delete_experiment,
     kill_experiment as orch_kill_experiment,
     list_docker_containers as orch_list_docker_containers,
@@ -42,7 +31,27 @@ from .lib.orchestrator.management import (
     read_tasks as orch_read_tasks,
     restart_experiment as orch_restart_experiment,
 )
-from .lib.dashboard.api_views import (
+from ..orchestrator_eval import (
+    extract_metrics as eval_extract_metrics,
+    has_result_event as eval_has_result_event,
+    read_eval_results as eval_read_results,
+    run_evaluate as eval_run_evaluate,
+)
+from ..orchestrator_queue import (
+    collect_used_idea_names as queue_collect_used_idea_names,
+    queue_idea as queue_queue_idea,
+)
+from ..orchestrator_service import OrchestratorService
+from ..orchestrator_workspace import (
+    analyst_reports_dir as ws_analyst_reports_dir,
+    build_reference_code_section as ws_build_reference_code_section,
+    copy_analyst_reports_to_workspace as ws_copy_analyst_reports_to_workspace,
+    get_analyst_reports_summary as ws_get_analyst_reports_summary,
+    prepare_analyst_workspace as ws_prepare_analyst_workspace,
+    prepare_workspace as ws_prepare_workspace,
+    resolve_base_solution as ws_resolve_base_solution,
+)
+from .api_views import (
     build_graph_payload as dashboard_build_graph_payload,
     build_state_payload as dashboard_build_state_payload,
     list_analyst_reports as dashboard_list_analyst_reports,
@@ -52,19 +61,10 @@ from .lib.dashboard.api_views import (
     read_experiment_file as dashboard_read_experiment_file,
     submission_blob as dashboard_submission_blob,
 )
-from .lib.orchestrator_workspace import (
-    analyst_reports_dir as ws_analyst_reports_dir,
-    build_reference_code_section as ws_build_reference_code_section,
-    copy_analyst_reports_to_workspace as ws_copy_analyst_reports_to_workspace,
-    get_analyst_reports_summary as ws_get_analyst_reports_summary,
-    prepare_analyst_workspace as ws_prepare_analyst_workspace,
-    prepare_workspace as ws_prepare_workspace,
-    resolve_base_solution as ws_resolve_base_solution,
-)
 
 load_dotenv()
 
-AWITUNE_DIR = Path(__file__).resolve().parent
+AWITUNE_DIR = Path(__file__).resolve().parents[2]
 PROXY_HOST = os.getenv("PROXY_HOST", "localhost")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
@@ -124,8 +124,7 @@ def prepare_analyst_workspace(exp_dir, analysis_focus, prev_exps):
     return ws_prepare_analyst_workspace(rt.cfg, exp_dir, analysis_focus)
 
 
-def prepare_workspace(base_path, exp_dir, custom_prompt, best_score, prev_exps,
-                      reference_code=None):
+def prepare_workspace(base_path, exp_dir, custom_prompt, best_score, prev_exps, reference_code=None):
     return ws_prepare_workspace(
         rt.cfg,
         base_path,
@@ -155,9 +154,15 @@ def _has_result_event(events_file: Path, tail_bytes: int = 65536) -> bool:
 
 
 # ---- Agent runner ----
-def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id,
-                        reference_code=None, task_type="experiment"):
-    return orch.run_agent_in_thread(exp_name, prompt, base_solution, gpu_id, reference_code=reference_code, task_type=task_type)
+def run_agent_in_thread(exp_name, prompt, base_solution, gpu_id, reference_code=None, task_type="experiment"):
+    return orch.run_agent_in_thread(
+        exp_name,
+        prompt,
+        base_solution,
+        gpu_id,
+        reference_code=reference_code,
+        task_type=task_type,
+    )
 
 
 def _finalize_analysis(exp_name, exp_dir, out, elapsed, ec):
@@ -179,7 +184,7 @@ def _collect_used_idea_names() -> set:
 
 
 def _queue_idea(idea: dict, idx: int) -> bool:
-    return queue_idea(rt, rt.cfg, idea, idx, resolve_base_solution, orchestrator_log)
+    return queue_queue_idea(rt, rt.cfg, idea, idx, resolve_base_solution, orchestrator_log)
 
 
 def worker_loop():
@@ -223,10 +228,9 @@ def api_launch():
     parent = base_experiment if base_experiment and base_experiment != "default" else ""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = "analyst" if task_type == "analysis" else "agent"
-    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', name or "")[:40] if name else ""
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", name or "")[:40] if name else ""
     eid = f"{prefix}_{safe_name}_{ts}" if safe_name else f"{prefix}_{ts}"
-    db.create_experiment(eid, prompt=prompt, base_solution=base,
-                         parent_experiment=parent, task_type=task_type)
+    db.create_experiment(eid, prompt=prompt, base_solution=base, parent_experiment=parent, task_type=task_type)
     db.add_log(eid, f"Queued {task_type}: {prompt[:100]}")
     item = {"id": eid, "prompt": prompt, "base_solution": base, "task_type": task_type}
     with rt.lock:

@@ -48,7 +48,7 @@ def cmd_run(args):
 
     from . import db
     from . import idea_feeder, generate_ideas
-    from ..dashboard import app, init_app, start_proxy, start_worker, rt, recover_orphaned_experiments
+    from .dashboard.app import app, init_app, start_proxy, start_worker, rt, recover_orphaned_experiments
     from .orchestrator_tools import configure as configure_tools
 
     init_app(cfg)
