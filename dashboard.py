@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import threading
 import time
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -20,6 +19,34 @@ from flask_cors import CORS
 
 from .lib import db
 from .lib.config import ProjectConfig
+from .lib.dashboard_proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
+from .lib.dashboard_runtime import (
+    MAX_AUTO_QUEUE_SIZE,
+    ORCHESTRATOR_LOG_PATH,
+    RuntimeState,
+    get_docker_cmd,
+    orchestrator_log,
+)
+from .lib.orchestrator_eval import (
+    extract_metrics as eval_extract_metrics,
+    has_result_event as eval_has_result_event,
+    read_eval_results as eval_read_results,
+    run_evaluate as eval_run_evaluate,
+)
+from .lib.orchestrator_queue import (
+    collect_used_idea_names as queue_collect_used_idea_names,
+    queue_idea as queue_queue_idea,
+)
+from .lib.notifications import send_telegram_notification as notify_telegram
+from .lib.orchestrator_workspace import (
+    analyst_reports_dir as ws_analyst_reports_dir,
+    build_reference_code_section as ws_build_reference_code_section,
+    copy_analyst_reports_to_workspace as ws_copy_analyst_reports_to_workspace,
+    get_analyst_reports_summary as ws_get_analyst_reports_summary,
+    prepare_analyst_workspace as ws_prepare_analyst_workspace,
+    prepare_workspace as ws_prepare_workspace,
+    resolve_base_solution as ws_resolve_base_solution,
+)
 
 load_dotenv()
 
@@ -31,138 +58,9 @@ app = Flask(__name__, template_folder=str(AWITUNE_DIR / "templates"))
 CORS(app)
 
 
-# ---- Orchestrator log ----
-ORCHESTRATOR_LOG_PATH = Path("/tmp/awitune_orchestrator.log")
-MAX_AUTO_QUEUE_SIZE = 5
-
-
-def clean_output(text: str) -> str:
-    """Remove carriage returns and other control characters that break terminal output."""
-    # Remove \r (carriage return) which causes line overwriting
-    text = text.replace('\r', '')
-    # Remove other control characters except newline and tab
-    import re
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    return text
-
-
-def orchestrator_log(message: str):
-    """Log orchestrator activity to file."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    message = clean_output(message)
-    line = f"[{timestamp}] {message}\n"
-    with open(ORCHESTRATOR_LOG_PATH, "a") as f:
-        f.write(line)
-    print(f"[orchestrator] {message}", flush=True)
-
-
 # ---- Telegram notifications ----
 def send_telegram_notification(message: str, parse_mode: str = "HTML"):
-    """Send a notification to Telegram if configured."""
-    if rt.cfg is None:
-        return
-    
-    bot_token = rt.cfg.telegram_bot_token
-    chat_id = rt.cfg.telegram_chat_id
-    
-    if not bot_token or not chat_id:
-        return
-    
-    try:
-        import requests
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": parse_mode,
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"[telegram] Failed to send notification: {response.status_code} {response.text}")
-    except Exception as e:
-        print(f"[telegram] Error sending notification: {e}")
-
-
-# ---- Global runtime state ----
-class RuntimeState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.manual_queue = deque()
-        self.auto_queue = deque()
-        self.running_gpus = {}  # {gpu_id: [exp_name1, exp_name2, ...]} - list of experiments per GPU
-        self.used_idea_names = set()
-        self.proxy_proc = None
-        self.worker_running = False
-        self.worker_thread = None
-        self.cfg: ProjectConfig = None
-
-    def get_gpu_slots_used(self, gpu_id: int) -> int:
-        """Get number of slots currently used on a GPU."""
-        return len(self.running_gpus.get(gpu_id, []))
-
-    def get_available_gpu(self) -> int | None:
-        """Find a GPU with available slots. Returns GPU ID or None."""
-        slots_per_gpu = self.cfg.slots_per_gpu if self.cfg else 1
-        for g in (self.cfg.gpus if self.cfg else [0]):
-            if self.get_gpu_slots_used(g) < slots_per_gpu:
-                return g
-        return None
-
-    def add_experiment_to_gpu(self, gpu_id: int, exp_name: str):
-        """Add an experiment to a GPU's running list."""
-        if gpu_id not in self.running_gpus:
-            self.running_gpus[gpu_id] = []
-        if exp_name not in self.running_gpus[gpu_id]:
-            self.running_gpus[gpu_id].append(exp_name)
-
-    def remove_experiment_from_gpu(self, gpu_id: int, exp_name: str):
-        """Remove an experiment from a GPU's running list."""
-        if gpu_id in self.running_gpus:
-            try:
-                self.running_gpus[gpu_id].remove(exp_name)
-                if not self.running_gpus[gpu_id]:
-                    del self.running_gpus[gpu_id]
-            except ValueError:
-                pass
-
-    def sync_running_from_docker(self):
-        try:
-            r = subprocess.run(
-                DOCKER_CMD + ["ps", "--filter", "name=agent-", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=5)
-            active_containers = set(r.stdout.strip().split("\n")) if r.stdout.strip() else set()
-            zombies_to_kill = []
-            with self.lock:
-                # Rebuild running map from docker to drop stale entries.
-                rebuilt_running = {}
-                for cn in active_containers:
-                    if not cn:
-                        continue
-                    parts = cn.rsplit("-gpu", 1)
-                    if len(parts) == 2:
-                        try:
-                            gpu = int(parts[1])
-                            exp_name = parts[0].replace("agent-", "", 1)
-                            exp = db.get_experiment(exp_name)
-                            if exp and exp.get("status") in ("completed", "failed", "killed", "cancelled"):
-                                zombies_to_kill.append(cn)
-                            else:
-                                rebuilt_running.setdefault(gpu, [])
-                                if exp_name not in rebuilt_running[gpu]:
-                                    rebuilt_running[gpu].append(exp_name)
-                        except ValueError:
-                            pass
-                self.running_gpus = rebuilt_running
-            for cn in zombies_to_kill:
-                try:
-                    subprocess.run(DOCKER_CMD + ["kill", cn], capture_output=True, timeout=10)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
-rt = RuntimeState()
+    notify_telegram(rt.cfg, message, parse_mode=parse_mode)
 
 
 def trim_auto_queue(max_size: int = MAX_AUTO_QUEUE_SIZE) -> int:
@@ -184,19 +82,8 @@ def trim_auto_queue(max_size: int = MAX_AUTO_QUEUE_SIZE) -> int:
     return len(removed)
 
 
-# ---- Docker ----
-def get_docker_cmd():
-    for cmd in [["docker"], ["sudo", "docker"]]:
-        try:
-            r = subprocess.run(cmd + ["info"], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                return cmd
-        except Exception:
-            pass
-    return ["docker"]
-
-
 DOCKER_CMD = get_docker_cmd()
+rt = RuntimeState(DOCKER_CMD)
 
 
 def _force_rmtree(path: Path):
@@ -209,271 +96,66 @@ def _force_rmtree(path: Path):
 
 # ---- Proxy ----
 def start_proxy():
-    if rt.proxy_proc and rt.proxy_proc.poll() is None:
-        return
-    venv_py = Path(os.environ.get("VIRTUAL_ENV", "")) / "bin" / "python3"
-    py = str(venv_py) if venv_py.exists() else "python3"
-    env = os.environ.copy()
-    env["PROXY_HOST"] = PROXY_HOST
-    env["PROXY_PORT"] = str(rt.cfg.proxy_port)
-    rt.proxy_proc = subprocess.Popen(
-        [py, str(AWITUNE_DIR / "lib" / "proxy.py")], cwd=str(AWITUNE_DIR), env=env,
-        stdout=open("/tmp/awitune_proxy.log", "a"), stderr=subprocess.STDOUT,
-        start_new_session=True)  # Detach from terminal to prevent signal propagation
-    time.sleep(2)
+    runtime_start_proxy(rt, AWITUNE_DIR, PROXY_HOST)
 
 
 def stop_proxy():
-    if rt.proxy_proc and rt.proxy_proc.poll() is None:
-        rt.proxy_proc.terminate()
-        try:
-            rt.proxy_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            rt.proxy_proc.kill()
-    rt.proxy_proc = None
+    runtime_stop_proxy(rt)
 
 
 # ---- Workspace ----
 def resolve_base_solution(base_experiment: str) -> str:
-    if not base_experiment or base_experiment == "default":
-        return str(rt.cfg.solutions_dir / "baseline")
-    exp = db.get_experiment(base_experiment)
-    if exp and exp.get("workspace_dir"):
-        ws_path = Path(exp["workspace_dir"])
-        if ws_path.is_dir() and (ws_path / "run.py").exists():
-            return str(ws_path)
-    return str(rt.cfg.solutions_dir / "baseline")
+    return ws_resolve_base_solution(rt.cfg, base_experiment)
 
 
 def build_reference_code_section(reference_code: dict) -> str:
-    if not reference_code:
-        return ""
-    ref_exp_name = reference_code.get("experiment", "")
-    what_to_take = reference_code.get("what_to_take", "")
-    if not ref_exp_name:
-        return ""
-
-    if rt.cfg.reference_dir:
-        ref_dir = rt.cfg.reference_dir / ref_exp_name
-        if ref_dir.is_dir():
-            files = reference_code.get("files")
-            if not files:
-                files = [f.name for f in sorted(ref_dir.glob("*.py"))]
-            section = f"\n\n## Reference Code: {ref_exp_name}\n"
-            if what_to_take:
-                section += f"**Specifically**: {what_to_take}\n"
-            for fname in files:
-                fpath = ref_dir / fname
-                if fpath.exists():
-                    code = fpath.read_text(errors="replace")
-                    if len(code) > 20000:
-                        code = code[:20000] + "\n# ... (truncated) ...\n"
-                    section += f"\n### {fname}\n```python\n{code}\n```\n"
-            return section
-
-    ref_exp = db.get_experiment(ref_exp_name)
-    if not ref_exp or not ref_exp.get("workspace_dir"):
-        return ""
-    ref_run_py = Path(ref_exp["workspace_dir"]) / "run.py"
-    if not ref_run_py.exists():
-        return ""
-    ref_code = ref_run_py.read_text(errors="replace")
-    ref_score = ref_exp.get("test_score", "?")
-    section = f"\n\n## Reference Code (from experiment {ref_exp_name}, score {ref_score})\n"
-    if what_to_take:
-        section += f"**Specifically**: {what_to_take}\n"
-    section += f"\n```python\n{ref_code}\n```\n"
-    return section
+    return ws_build_reference_code_section(rt.cfg, reference_code)
 
 
 def _analyst_reports_dir():
-    return rt.cfg.data_dir / "analyst_reports"
+    return ws_analyst_reports_dir(rt.cfg)
 
 
 def get_analyst_reports_summary() -> str:
-    d = _analyst_reports_dir()
-    if not d.exists():
-        return "No previous analysis has been done yet."
-    reports = sorted(d.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not reports:
-        return "No previous analysis has been done yet."
-    parts = []
-    for r in reports[:5]:
-        content = r.read_text(errors="replace")
-        if len(content) > 3000:
-            content = content[:3000] + "\n... (truncated) ...\n"
-        parts.append(f"### {r.stem}\n{content}\n")
-    return "\n".join(parts)
+    return ws_get_analyst_reports_summary(rt.cfg)
 
 
 def copy_analyst_reports_to_workspace(ws: Path):
-    d = _analyst_reports_dir()
-    if not d.exists():
-        return
-    reports = sorted(d.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not reports:
-        return
-    dest = ws / "analyst_reports"
-    dest.mkdir(exist_ok=True)
-    for r in reports[:10]:
-        shutil.copy2(r, dest / r.name)
-    for j in d.glob("*.json"):
-        shutil.copy2(j, dest / j.name)
-    os.chmod(dest, 0o777)
-    for f in dest.iterdir():
-        os.chmod(f, 0o666)
+    ws_copy_analyst_reports_to_workspace(rt.cfg, ws)
 
 
 def prepare_analyst_workspace(exp_dir, analysis_focus, prev_exps):
-    ws = exp_dir / "workspace"
-    if ws.exists():
-        subprocess.run(["chmod", "-R", "u+rwX", str(ws)], capture_output=True, timeout=30)
-    ws.mkdir(parents=True, exist_ok=True)
-    os.chmod(ws, 0o777)
-    copy_analyst_reports_to_workspace(ws)
-
-    if rt.cfg.analyst_prompt and rt.cfg.analyst_prompt.exists():
-        tpl = rt.cfg.analyst_prompt.read_text()
-        prompt = tpl.replace("{ANALYSIS_FOCUS}", analysis_focus or "General dataset exploration")
-        prompt = prompt.replace("{PREVIOUS_ANALYSIS}", get_analyst_reports_summary())
-    else:
-        prompt = f"# Analysis Task\n\n{analysis_focus}\n"
-
-    (exp_dir / "CLAUDE.md").write_text(prompt)
-    od = exp_dir / "output"
-    od.mkdir(exist_ok=True)
-    os.chmod(od, 0o777)
-    return ws
+    return ws_prepare_analyst_workspace(rt.cfg, exp_dir, analysis_focus)
 
 
 def prepare_workspace(base_path, exp_dir, custom_prompt, best_score, prev_exps,
                       reference_code=None):
-    ws = exp_dir / "workspace"
-    if ws.exists():
-        subprocess.run(["chmod", "-R", "u+rwX", str(ws)], capture_output=True, timeout=30)
-    ws.mkdir(parents=True, exist_ok=True)
-    base = Path(base_path)
-    if base.is_dir():
-        for f in base.iterdir():
-            if f.is_file():
-                shutil.copy2(f, ws / f.name)
-
-    project_readme = rt.cfg.project_dir / "README.md"
-    if project_readme.exists():
-        shutil.copy2(project_readme, ws / "README.md")
-
-    os.chmod(ws, 0o777)
-    for f in ws.iterdir():
-        os.chmod(f, 0o666)
-
-    exp_info = f"# Experiment: {exp_dir.name}\n\n"
-    exp_info += f"**Created**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    exp_info += f"**Base solution**: {base_path}\n"
-    exp_info += f"**Best score at start**: {best_score:.6f}\n\n"
-    if custom_prompt:
-        exp_info += f"## Custom Prompt\n\n{custom_prompt}\n\n"
-    (exp_dir / "EXPERIMENT_INFO.md").write_text(exp_info)
-
-    prev_md = f"# Previous Experiments\n\nBest score: **{best_score:.6f}**\n\n"
-    if prev_exps:
-        prev_md += "| # | Name | Score | Notes |\n|---|------|-------|-------|\n"
-        for i, e in enumerate(prev_exps[-20:]):
-            score = e.get("test_score") or "?"
-            prev_md += f"| {i+1} | {e.get('name','')} | {score} | {e.get('notes','')} |\n"
-    (ws / "prev_experiments.md").write_text(prev_md)
-
-    copy_analyst_reports_to_workspace(ws)
-
-    tpl = rt.cfg.agent_prompt.read_text()
-    prompt = tpl.replace("{BEST_SCORE}", f"{best_score:.6f}")
-    if custom_prompt:
-        prompt += f"\n\n## SPECIFIC TASK FOR THIS RUN\n{custom_prompt}\n"
-    ref_section = build_reference_code_section(reference_code)
-    if ref_section:
-        prompt += ref_section
-    if reference_code and reference_code.get("experiment") and rt.cfg.reference_dir:
-        ref_dir = rt.cfg.reference_dir / reference_code["experiment"]
-        if ref_dir.is_dir():
-            ref_dest = ws / "reference"
-            ref_dest.mkdir(exist_ok=True)
-            for f in ref_dir.glob("*.py"):
-                shutil.copy2(f, ref_dest / f.name)
-            os.chmod(ref_dest, 0o777)
-            for f in ref_dest.iterdir():
-                os.chmod(f, 0o666)
-    (exp_dir / "CLAUDE.md").write_text(prompt)
-
-    od = exp_dir / "output"
-    od.mkdir(exist_ok=True)
-    os.chmod(od, 0o777)
-    return ws
+    return ws_prepare_workspace(
+        rt.cfg,
+        base_path,
+        exp_dir,
+        custom_prompt,
+        best_score,
+        prev_exps,
+        reference_code=reference_code,
+    )
 
 
 # ---- Evaluation helpers ----
 def _run_evaluate(out: Path, log_path: Path = None):
-    """Run the project's evaluate.py on an output directory."""
-    venv_py = Path(os.environ.get("VIRTUAL_ENV", "")) / "bin" / "python3"
-    py = str(venv_py) if venv_py.exists() else "python3"
-    result = subprocess.run(
-        [py, str(rt.cfg.evaluate_script), str(out), "--data-dir", str(rt.cfg.data_dir)],
-        capture_output=True, text=True, timeout=300
-    )
-    if log_path:
-        eval_out = (result.stdout or "").strip() + "\n" + (result.stderr or "").strip()
-        if eval_out.strip():
-            with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write("\n\n=== evaluate.py (host) ===\n")
-                lf.write(eval_out)
-                lf.write("\n")
-    return result
+    return eval_run_evaluate(rt.cfg, out, log_path)
 
 
 def _read_eval_results(out: Path) -> dict:
-    ep = out / "eval_results.json"
-    if ep.exists():
-        try:
-            return json.loads(ep.read_text())
-        except Exception:
-            pass
-    return {}
+    return eval_read_results(out)
 
 
 def _extract_metrics(ev: dict) -> tuple[float, float]:
-    """Extract test and val scores from eval_results using config metric keys."""
-    test = ev.get(rt.cfg.test_metric_key, 0) or 0
-    val = ev.get(rt.cfg.val_metric_key, 0) or 0
-    return test, val
+    return eval_extract_metrics(rt.cfg, ev)
 
 
 def _has_result_event(events_file: Path, tail_bytes: int = 65536) -> bool:
-    """Best-effort detection of a terminal 'result' event in events.jsonl."""
-    if not events_file.exists():
-        return False
-    try:
-        with open(events_file, "rb") as ef:
-            ef.seek(0, 2)
-            sz = ef.tell()
-            ef.seek(max(0, sz - tail_bytes))
-            tail = ef.read().decode("utf-8", errors="ignore")
-
-        # Fast path: support both compact JSON and JSON with spaces.
-        if re.search(r'"type"\s*:\s*"result"', tail):
-            return True
-
-        # Fallback: parse JSONL lines when formatting is unusual.
-        for line in tail.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "result":
-                return True
-    except Exception:
-        return False
-    return False
+    return eval_has_result_event(events_file, tail_bytes=tail_bytes)
 
 
 # ---- Agent runner ----
@@ -677,75 +359,11 @@ def _get_idea_feeder():
 
 # ---- Worker ----
 def _collect_used_idea_names() -> set:
-    """Collect names of already used ideas from experiments and queues."""
-    used_idea_names = set()
-    all_exps = db.get_all_experiments(limit=2000)
-    for e in all_exps:
-        exp_name = e.get("name", "")
-        if exp_name.startswith("auto_"):
-            parts = exp_name[5:]
-            segments = parts.rsplit("_", 2)
-            if len(segments) >= 3:
-                used_idea_names.add(segments[0])
-
-    with rt.lock:
-        for item in rt.manual_queue:
-            if item.get("idea_name"):
-                used_idea_names.add(item["idea_name"])
-        for item in rt.auto_queue:
-            if item.get("idea_name"):
-                used_idea_names.add(item["idea_name"])
-        rt.used_idea_names = used_idea_names
-
-    return used_idea_names
+    return queue_collect_used_idea_names(rt)
 
 
 def _queue_idea(idea: dict, idx: int) -> bool:
-    """Queue a single idea. Returns True if successful."""
-    try:
-        if not isinstance(idea, dict):
-            orchestrator_log(f"Skipping invalid idea at index {idx}: not a dict")
-            return False
-
-        idea_name = str(idea.get("name") or "").strip()
-        idea_prompt = str(idea.get("prompt") or "").strip()
-        if not idea_name or not idea_prompt:
-            orchestrator_log(f"Skipping invalid idea at index {idx}: missing name or prompt")
-            return False
-
-        # Milliseconds + per-batch index to avoid ID collisions.
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        eid = f"auto_{idea_name}_{ts}_{idx}"
-        base_exp = str(idea.get("base_experiment", "default") or "default")
-        base_sol = resolve_base_solution(base_exp)
-        parent = base_exp if base_exp and base_exp != "default" else ""
-        idea_task_type = str(idea.get("task_type", "experiment") or "experiment")
-        idea_reasoning = str(idea.get("reasoning", "") or "")
-
-        db.create_experiment(
-            eid,
-            prompt=idea_prompt[:500],
-            base_solution=base_sol,
-            parent_experiment=parent,
-            task_type=idea_task_type,
-        )
-        db.add_log(eid, f"Auto-queued {idea_task_type}: {idea_name}")
-        orchestrator_log(f"Queued: {eid} ({idea_task_type}) - {idea_reasoning[:100]}")
-        item = {
-            "id": eid,
-            "prompt": idea_prompt,
-            "base_solution": base_sol,
-            "idea_name": idea_name,
-            "auto": True,
-            "reference_code": idea.get("reference_code"),
-            "task_type": idea_task_type,
-        }
-        with rt.lock:
-            rt.auto_queue.append(item)
-        return True
-    except Exception as e:
-        orchestrator_log(f"Failed to queue idea at index {idx}: {e}")
-        return False
+    return queue_queue_idea(rt, rt.cfg, idea, idx, resolve_base_solution, orchestrator_log)
 
 
 def worker_loop():
