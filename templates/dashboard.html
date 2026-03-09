@@ -268,8 +268,11 @@ async function rf(){
                         const st=f.status||'queued';
                         const color=st==='completed'?'#3fb950':(st==='running'?'#d29922':(st==='failed'?'#f85149':'#8b949e'));
                         const cvTxt=(f.cv_score!==null&&f.cv_score!==undefined)?Number(f.cv_score).toFixed(5):'—';
+                        const killBtn=st==='running'?`<button class="bt r" onclick="event.stopPropagation();ki('${f.name}')" style="padding:1px 4px;font-size:9px" title="Kill">⏹</button>`:'';
+                        const restartBtn=st!=='running'&&st!=='queued'?`<button class="bt" onclick="event.stopPropagation();re('${f.name}')" style="padding:1px 4px;font-size:9px" title="Restart">🔄</button>`:'';
                         return `<span style="display:inline-flex;gap:4px;align-items:center;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:2px 6px;margin:2px;cursor:pointer" onclick="ofl('${f.name}')">
                             <span style="color:${color};font-size:10px">●</span><span style="font-size:10px">${(f.name||'').slice(0,28)}</span><span style="color:#8b949e;font-size:10px">cv ${cvTxt}</span>
+                            ${killBtn}${restartBtn}
                         </span>`;
                     }).join('');
                     oofCard = `<div class="mc" style="min-width:300px;text-align:left">

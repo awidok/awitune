@@ -713,6 +713,11 @@ class OrchestratorService:
         return sorted(set(detected))
 
     def _has_ready_oof_for_experiment(self, exp_name: str) -> bool:
+        # First check if experiment is completed successfully
+        exp = db.get_experiment(exp_name) or {}
+        if exp.get("status") != "completed":
+            return False
+        # Then check if OOF predictions exist
         rows = self._load_oof_registry()
         for row in rows:
             if str(row.get("experiment") or "") != exp_name:
@@ -723,24 +728,12 @@ class OrchestratorService:
 
     def _build_oof_runner_script(self) -> str:
         return """import argparse
+import json
 import subprocess
 from pathlib import Path
 
 import numpy as np
 import polars as pl
-
-
-def get_splitter(y, n_splits: int):
-    try:
-        from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
-
-        splitter = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        return splitter.split(np.zeros((len(y), 1)), y)
-    except Exception:
-        from sklearn.model_selection import KFold
-
-        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        return splitter.split(np.arange(len(y)))
 
 
 def main():
@@ -750,6 +743,7 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--fold-idx", type=int, required=True)
     parser.add_argument("--n-folds", type=int, required=True)
+    parser.add_argument("--parent-output", default="", help="Parent experiment output dir for fold 4 reuse")
     args = parser.parse_args()
 
     workspace = Path(args.workspace)
@@ -757,18 +751,95 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_path = data_dir / "local_train.parquet"
+    # Load split indices from pre-generated file
+    split_path = data_dir / "split_indices.json"
+    if not split_path.exists():
+        raise RuntimeError(f"split_indices.json not found at {split_path}")
+
+    with open(split_path) as f:
+        split_data = json.load(f)
+
+    oof_folds = split_data.get("oof_folds", [])
+    n_oof_folds = len(oof_folds)
+
+    if args.fold_idx < 0 or args.fold_idx >= n_oof_folds:
+        raise RuntimeError(f"Invalid fold index {args.fold_idx} for {n_oof_folds} OOF folds")
+
+    # Get fold indices
+    fold_info = oof_folds[args.fold_idx]
+    train_idx = fold_info["train_idx"]
+    val_idx = fold_info["val_idx"]
+
+    print(f"OOF fold {args.fold_idx}: train={len(train_idx)}, val={len(val_idx)}")
+
+    # Check if this is fold 4 and we can reuse parent predictions
+    # Fold 4 uses same train data as baseline (folds 0-3), so we can reuse
+    if args.fold_idx == 4 and args.parent_output:
+        parent_output = Path(args.parent_output)
+        val_pred = parent_output / "val_predictions.parquet"
+        test_pred = parent_output / "test_predictions.parquet"
+        submit_pred = parent_output / "submission.parquet"
+
+        if val_pred.exists():
+            print(f"Reusing predictions from parent experiment: {parent_output}")
+            # For OOF fold 4, we need predictions on entire fold 4 (val + test)
+            # Parent has val on fold4_val and test on fold4_test
+            # Combine them for full fold 4 coverage
+            holdout = split_data.get("holdout_fold", {})
+            fold4_val_idx = holdout.get("val_idx", [])
+            fold4_test_idx = holdout.get("test_idx", [])
+
+            if fold4_val_idx and fold4_test_idx:
+                # Load parent predictions
+                val_df = pl.read_parquet(str(val_pred))
+                test_df = pl.read_parquet(str(test_pred)) if test_pred.exists() else None
+
+                # Load customer_ids from fold 4 data
+                train_path = data_dir / "train.parquet"
+                if not train_path.exists():
+                    train_path = data_dir / "local_train.parquet"
+                full_df = pl.read_parquet(str(train_path), columns=["customer_id"])
+
+                # Build combined predictions for entire fold 4
+                predict_cols = [c for c in val_df.columns if c.startswith("predict_")]
+
+                # Get customer_ids for val and test portions
+                val_customers = full_df[fold4_val_idx].select("customer_id")
+                test_customers = full_df[fold4_test_idx].select("customer_id")
+
+                # Join predictions with correct customer_ids
+                val_preds_aligned = val_customers.join(val_df, on="customer_id", how="left")
+                test_preds_aligned = test_customers.join(test_df, on="customer_id", how="left") if test_df else None
+
+                if test_preds_aligned is not None:
+                    combined = pl.concat([val_preds_aligned, test_preds_aligned])
+                    combined.write_parquet(str(output_dir / "oof_fold_predictions.parquet"))
+                    print(f"Combined val+test predictions for fold 4: {len(combined)} rows")
+                else:
+                    # Fallback: just use val predictions
+                    (output_dir / "oof_fold_predictions.parquet").write_bytes(val_pred.read_bytes())
+
+                # Copy submission
+                if submit_pred.exists():
+                    (output_dir / "submission_fold.parquet").write_bytes(submit_pred.read_bytes())
+
+                print("Successfully reused parent predictions for OOF fold 4")
+                return
+            else:
+                print("WARNING: Could not find holdout fold indices, running training instead")
+
+    # Standard OOF training for folds 0-3
+    # Load full training data (train.parquet contains all data)
+    train_path = data_dir / "train.parquet"
+    if not train_path.exists():
+        # Fallback to local_train if train.parquet doesn't exist
+        train_path = data_dir / "local_train.parquet"
+
     df = pl.read_parquet(str(train_path))
     target_cols = [c for c in df.columns if c.startswith("target_")]
     if not target_cols:
-        raise RuntimeError("No target_* columns found in local_train.parquet")
+        raise RuntimeError("No target_* columns found in training data")
 
-    y = df.select(target_cols).to_numpy()
-    splits = list(get_splitter(y, args.n_folds))
-    if args.fold_idx < 0 or args.fold_idx >= len(splits):
-        raise RuntimeError(f"Invalid fold index {args.fold_idx} for {len(splits)} splits")
-
-    train_idx, val_idx = splits[args.fold_idx]
     fold_data_dir = output_dir / "fold_data"
     fold_data_dir.mkdir(parents=True, exist_ok=True)
     train_prefix = fold_data_dir / "train"
@@ -882,8 +953,10 @@ if __name__ == "__main__":
         for exp_name in extras:
             db.delete_experiment(exp_name)
 
+        # Only create slots for folds 0 to n_folds-2 (last fold reuses parent predictions)
+        # This allows OOF fold 4 to reuse baseline's val+test predictions
         slots: list[tuple[int, str]] = []
-        for fold_idx in range(n_folds):
+        for fold_idx in range(n_folds - 1):
             existing = by_fold_idx.get(fold_idx)
             if existing:
                 eid = str(existing.get("name") or "")
@@ -1055,7 +1128,8 @@ if __name__ == "__main__":
             and e.get("status") == "completed"
         ]
         n_folds = int(self.rt.cfg.stacking_oof_folds)
-        if len(fold_exps) < n_folds:
+        # We need n_folds-1 completed fold experiments (fold 4 reuses parent predictions)
+        if len(fold_exps) < n_folds - 1:
             return
 
         parts = []
@@ -1073,6 +1147,21 @@ if __name__ == "__main__":
             if submit_fp.exists():
                 submit_df = pl.read_parquet(str(submit_fp))
                 submit_parts.append((e["name"], submit_df))
+
+        # Fold 4: reuse parent's val + test predictions
+        parent_out = self.rt.cfg.experiments_dir / parent_exp_name / "output"
+        val_fp = parent_out / "val_predictions.parquet"
+        test_fp = parent_out / "test_predictions.parquet"
+        if val_fp.exists() and test_fp.exists():
+            val_df = pl.read_parquet(str(val_fp))
+            test_df = pl.read_parquet(str(test_fp))
+            fold4_df = pl.concat([val_df, test_df], how="vertical")
+            parts.append(fold4_df)
+            # Use parent's CV score for fold 4
+            parent_exp = db.get_experiment(parent_exp_name) or {}
+            if isinstance(parent_exp.get("val_score"), (int, float)):
+                fold_cv_scores.append(float(parent_exp["val_score"]))
+
         if len(parts) < n_folds:
             return
 
@@ -1080,7 +1169,6 @@ if __name__ == "__main__":
         if "customer_id" in merged.columns:
             merged = merged.unique(subset=["customer_id"], keep="first")
 
-        parent_out = self.rt.cfg.experiments_dir / parent_exp_name / "output"
         parent_out.mkdir(parents=True, exist_ok=True)
         final_oof = parent_out / "oof_predictions.parquet"
         merged.write_parquet(str(final_oof))
@@ -1108,10 +1196,13 @@ if __name__ == "__main__":
 
         parent = db.get_experiment(parent_exp_name) or {}
         self._register_oof_predictions(parent_exp_name, parent_out, parent.get("test_score"))
-        if fold_cv_scores:
+        # Only update CV score if we have all n_folds scores (including fold 4 from parent)
+        if len(fold_cv_scores) == n_folds:
             cv_score = float(sum(fold_cv_scores) / len(fold_cv_scores))
             db.update_experiment(parent_exp_name, cv_score=cv_score)
             db.add_log(parent_exp_name, f"Updated CV score from OOF folds: {cv_score:.6f}")
+        else:
+            db.add_log(parent_exp_name, f"CV score not updated: have {len(fold_cv_scores)}/{n_folds} fold scores")
         db.add_log(parent_exp_name, f"External OOF merged from {len(parts)} fold(s): {final_oof}")
 
     def _run_oof_fold_in_thread(self, exp_name: str, gpu_id: int, task_payload: dict):
@@ -1137,135 +1228,159 @@ if __name__ == "__main__":
         runner_path = Path(str(task_payload.get("oof_runner_path") or ""))
         parent = db.get_experiment(parent_exp) or {}
         parent_ws = Path(str(parent.get("workspace_dir") or ""))
+        parent_output = Path(str(parent.get("exp_dir") or "")) / "output"
 
-        db.update_experiment(exp_name, status="running", gpu_id=gpu_id, started_at=datetime.now().isoformat(), exp_dir=str(exp_dir))
-        db.add_log(exp_name, f"Starting external OOF fold {fold_idx + 1}/{n_folds} on GPU {gpu_id}")
-        t0 = time.time()
+        # Simple retry logic
+        max_retries = 2
         exit_code = -1
-        try:
-            if not parent_ws.exists() or not (parent_ws / "run.py").exists():
-                raise RuntimeError(f"Parent workspace/run.py not found for {parent_exp}")
-            if not runner_path.exists():
-                if parent_exp:
-                    parent_dir = cfg.experiments_dir / parent_exp
-                    parent_dir.mkdir(parents=True, exist_ok=True)
-                    runner_path = parent_dir / "oof_runner.py"
-                    runner_path.write_text(self._build_oof_runner_script())
-                else:
-                    raise RuntimeError(f"OOF runner script not found: {runner_path}")
+        t0 = time.time()
 
-            cn = f"oof-{exp_name}-gpu{gpu_id}"[:120]
-            cmd = self.docker_cmd + [
-                "run",
-                "--rm",
-                "--network=host",
-                "--name",
-                cn,
-                "--gpus",
-                f"device={gpu_id}",
-            ] + self._docker_numa_args(gpu_id, int(task_payload.get("slot_index", 0) or 0)) + [
-                "--user",
-                "0:0",
-                "--entrypoint",
-                "python",
-                "-v",
-                f"{cfg.data_dir}:/app/data:ro",
-                "-v",
-                f"{parent_ws}:/app/workspace:ro",
-                "-v",
-                f"{out}:/app/output",
-                "-v",
-                f"{runner_path}:/app/oof_runner.py:ro",
-                cfg.docker_image,
-                "/app/oof_runner.py",
-                "--workspace",
-                "/app/workspace",
-                "--data-dir",
-                "/app/data",
-                "--output-dir",
-                "/app/output",
-                "--fold-idx",
-                str(fold_idx),
-                "--n-folds",
-                str(n_folds),
-            ]
-
-            with open(log_path, "w", encoding="utf-8") as lf:
-                lf.write(f"[{datetime.now().isoformat()}] OOF launch\n")
-                lf.write(f"experiment: {exp_name}\n")
-                lf.write(f"container: {cn}\n")
-                lf.write(f"gpu: {gpu_id}\n")
-                lf.write(f"fold: {fold_idx + 1}/{n_folds}\n")
-                lf.write(f"command: {' '.join(cmd)}\n")
-                lf.write("-" * 80 + "\n")
-                lf.flush()
-                proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-                deadline = time.time() + cfg.timeout_minutes * 60
-                while True:
-                    ret = proc.poll()
-                    if ret is not None:
-                        exit_code = ret
-                        break
-                    if time.time() > deadline:
-                        lf.write(f"\n[{datetime.now().isoformat()}] TIMEOUT reached, stopping container {cn}\n")
-                        lf.flush()
-                        subprocess.run(self.docker_cmd + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
-                        proc.wait(timeout=60)
-                        exit_code = -1
-                        break
-                    time.sleep(5)
-                elapsed_min = (time.time() - t0) / 60
-                lf.write(f"\n[{datetime.now().isoformat()}] OOF finished with exit_code={exit_code}, elapsed={elapsed_min:.2f} min\n")
-                lf.flush()
-
-            oof_pred = out / "oof_fold_predictions.parquet"
-            status = "completed" if exit_code == 0 and oof_pred.exists() else "failed"
-            notes = f"external OOF fold {fold_idx + 1}/{n_folds}"
-            if status == "failed" and not oof_pred.exists():
-                notes = "failed: missing oof_fold_predictions.parquet"
-            fold_cv = None
-            metrics_fp = out / "run_output" / "metrics.json"
-            if metrics_fp.exists():
+        for retry_idx in range(max_retries + 1):
+            if retry_idx > 0:
+                db.add_log(exp_name, f"Retry {retry_idx}/{max_retries}")
+                # Clean up output directory for retry
                 try:
-                    metrics = json.loads(metrics_fp.read_text(errors="replace"))
-                    raw_cv = metrics.get(cfg.val_metric_key)
-                    if isinstance(raw_cv, (int, float)):
-                        fold_cv = float(raw_cv)
+                    subprocess.run(["rm", "-rf", str(out)], capture_output=True, timeout=15)
+                    out.mkdir(parents=True, exist_ok=True)
+                    os.chmod(out, 0o777)
                 except Exception:
-                    fold_cv = None
+                    pass
 
-            db.update_experiment(
-                exp_name,
-                status=status,
-                finished_at=datetime.now().isoformat(),
-                exit_code=exit_code,
-                elapsed_min=round((time.time() - t0) / 60, 2),
-                notes=notes,
-                cv_score=fold_cv,
-            )
-            db.add_log(exp_name, f"OOF fold finished with status={status}, exit={exit_code}")
-            if status == "completed" and parent_exp:
-                self._aggregate_parent_oof(parent_exp)
-            self._release_oof_lock_if_done(parent_exp)
-        except Exception as exc:
+            db.update_experiment(exp_name, status="running", gpu_id=gpu_id, started_at=datetime.now().isoformat(), exp_dir=str(exp_dir))
+            db.add_log(exp_name, f"Starting external OOF fold {fold_idx + 1}/{n_folds} on GPU {gpu_id}" + (f" (retry {retry_idx})" if retry_idx > 0 else ""))
+            exit_code = -1
             try:
-                with open(log_path, "a", encoding="utf-8") as lf:
-                    lf.write(f"\n[{datetime.now().isoformat()}] OOF ERROR: {exc}\n")
+                if not parent_ws.exists() or not (parent_ws / "run.py").exists():
+                    raise RuntimeError(f"Parent workspace/run.py not found for {parent_exp}")
+                if not runner_path.exists():
+                    if parent_exp:
+                        parent_dir = cfg.experiments_dir / parent_exp
+                        parent_dir.mkdir(parents=True, exist_ok=True)
+                        runner_path = parent_dir / "oof_runner.py"
+                        runner_path.write_text(self._build_oof_runner_script())
+                    else:
+                        raise RuntimeError(f"OOF runner script not found: {runner_path}")
+
+                cn = f"oof-{exp_name}-gpu{gpu_id}"[:120]
+                cmd = self.docker_cmd + [
+                    "run",
+                    "--rm",
+                    "--network=host",
+                    "--name",
+                    cn,
+                    "--gpus",
+                    f"device={gpu_id}",
+                ] + self._docker_numa_args(gpu_id, int(task_payload.get("slot_index", 0) or 0)) + [
+                    "--user",
+                    "0:0",
+                    "--entrypoint",
+                    "python",
+                    "-v",
+                    f"{cfg.data_dir}:/app/data:ro",
+                    "-v",
+                    f"{parent_ws}:/app/workspace:ro",
+                    "-v",
+                    f"{out}:/app/output",
+                    "-v",
+                    f"{runner_path}:/app/oof_runner.py:ro",
+                    "-v",
+                    f"{parent_output}:/app/parent_output:ro",
+                    cfg.docker_image,
+                    "/app/oof_runner.py",
+                    "--workspace",
+                    "/app/workspace",
+                    "--data-dir",
+                    "/app/data",
+                    "--output-dir",
+                    "/app/output",
+                    "--fold-idx",
+                    str(fold_idx),
+                    "--n-folds",
+                    str(n_folds),
+                    "--parent-output",
+                    "/app/parent_output" if parent_output.exists() else "",
+                ]
+
+                log_mode = "w" if retry_idx == 0 else "a"
+                with open(log_path, log_mode, encoding="utf-8") as lf:
+                    if retry_idx > 0:
+                        lf.write(f"\n{'='*80}\n")
+                    lf.write(f"[{datetime.now().isoformat()}] OOF launch (attempt {retry_idx + 1})\n")
+                    lf.write(f"experiment: {exp_name}\n")
+                    lf.write(f"container: {cn}\n")
+                    lf.write(f"gpu: {gpu_id}\n")
+                    lf.write(f"fold: {fold_idx + 1}/{n_folds}\n")
+                    lf.write(f"command: {' '.join(cmd)}\n")
+                    lf.write("-" * 80 + "\n")
+                    lf.flush()
+                    proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                    deadline = time.time() + cfg.timeout_minutes * 60
+                    while True:
+                        ret = proc.poll()
+                        if ret is not None:
+                            exit_code = ret
+                            break
+                        if time.time() > deadline:
+                            lf.write(f"\n[{datetime.now().isoformat()}] TIMEOUT reached, stopping container {cn}\n")
+                            lf.flush()
+                            subprocess.run(self.docker_cmd + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
+                            proc.wait(timeout=60)
+                            exit_code = -1
+                            break
+                        time.sleep(5)
+                    elapsed_min = (time.time() - t0) / 60
+                    lf.write(f"\n[{datetime.now().isoformat()}] OOF finished with exit_code={exit_code}, elapsed={elapsed_min:.2f} min\n")
+                    lf.flush()
+
+            except Exception as exc:
+                try:
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"\n[{datetime.now().isoformat()}] OOF ERROR: {exc}\n")
+                except Exception:
+                    pass
+                exit_code = -2
+
+            # Check if successful
+            oof_pred = out / "oof_fold_predictions.parquet"
+            if exit_code == 0 and oof_pred.exists():
+                break  # Success
+            elif retry_idx < max_retries:
+                # Retry on any failure
+                time.sleep(5)
+                continue
+            else:
+                break  # Max retries exceeded
+
+        # Final status update
+        oof_pred = out / "oof_fold_predictions.parquet"
+        status = "completed" if exit_code == 0 and oof_pred.exists() else "failed"
+        notes = f"external OOF fold {fold_idx + 1}/{n_folds}"
+        if status == "failed" and not oof_pred.exists():
+            notes = "failed: missing oof_fold_predictions.parquet"
+        fold_cv = None
+        metrics_fp = out / "run_output" / "metrics.json"
+        if metrics_fp.exists():
+            try:
+                metrics = json.loads(metrics_fp.read_text(errors="replace"))
+                raw_cv = metrics.get(cfg.val_metric_key)
+                if isinstance(raw_cv, (int, float)):
+                    fold_cv = float(raw_cv)
             except Exception:
-                pass
-            db.update_experiment(
-                exp_name,
-                status="failed",
-                finished_at=datetime.now().isoformat(),
-                exit_code=-2,
-                elapsed_min=round((time.time() - t0) / 60, 2),
-                notes=f"OOF ERROR: {exc}",
-            )
-            db.add_log(exp_name, f"OOF ERROR: {exc}", level="error")
-            self._release_oof_lock_if_done(parent_exp)
-        finally:
-            with self.rt.lock:
-                self.rt.remove_experiment_from_gpu(gpu_id, exp_name)
+                fold_cv = None
+
+        db.update_experiment(
+            exp_name,
+            status=status,
+            finished_at=datetime.now().isoformat(),
+            exit_code=exit_code,
+            elapsed_min=round((time.time() - t0) / 60, 2),
+            notes=notes,
+            cv_score=fold_cv,
+        )
+        db.add_log(exp_name, f"OOF fold finished with status={status}, exit={exit_code}")
+        if status == "completed" and parent_exp:
+            self._aggregate_parent_oof(parent_exp)
+        self._release_oof_lock_if_done(parent_exp)
 
     def worker_loop(self):
         last_sync_at = 0.0

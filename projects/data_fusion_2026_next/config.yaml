@@ -1,0 +1,26 @@
+name: data-fusion-2026
+docker_image: data-fusion-agent
+
+test_metric_key: test_macro_roc_auc
+val_metric_key: val_macro_roc_auc
+metric_direction: maximize
+
+gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+slots_per_gpu: 2
+timeout_minutes: 480
+max_turns: 500
+proxy_port: 8081
+
+# Telegram notifications
+telegram_bot_token: "8766105389:AAGQuZ4alw00Y2f4P3uHLx0QdVfg4Aol6xA"
+telegram_chat_id: "226095842"
+notify_on_improvement: true
+notify_on_failure: true
+notify_on_completion: false
+
+# Stacking orchestration mode
+enable_stacking_mode: true
+stacking_min_base_share: 0.6
+stacking_max_queue_share: 0.4
+stacking_oof_folds: 5  # All 5 folds for OOF (full 750k coverage)
+stacking_oof_splitter: MultilabelStratifiedKFold
