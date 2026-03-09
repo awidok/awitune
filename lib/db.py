@@ -284,11 +284,20 @@ def list_global_keys(prefix: str = "") -> list[str]:
 
 def get_stats(direction="DESC"):
     db = get_db()
-    total = db.execute("SELECT COUNT(*) as c FROM experiments").fetchone()["c"]
-    running = db.execute("SELECT COUNT(*) as c FROM experiments WHERE status = 'running'").fetchone()["c"]
-    completed = db.execute("SELECT COUNT(*) as c FROM experiments WHERE status = 'completed'").fetchone()["c"]
-    failed = db.execute("SELECT COUNT(*) as c FROM experiments WHERE status = 'failed'").fetchone()["c"]
-    improved = db.execute("SELECT COUNT(*) as c FROM experiments WHERE improved = 1").fetchone()["c"]
+    try:
+        total_row = db.execute("SELECT COUNT(*) as c FROM experiments").fetchone()
+        total = total_row["c"] if total_row else 0
+        running_row = db.execute("SELECT COUNT(*) as c FROM experiments WHERE status = 'running'").fetchone()
+        running = running_row["c"] if running_row else 0
+        completed_row = db.execute("SELECT COUNT(*) as c FROM experiments WHERE status = 'completed'").fetchone()
+        completed = completed_row["c"] if completed_row else 0
+        failed_row = db.execute("SELECT COUNT(*) as c FROM experiments WHERE status = 'failed'").fetchone()
+        failed = failed_row["c"] if failed_row else 0
+        improved_row = db.execute("SELECT COUNT(*) as c FROM experiments WHERE improved = 1").fetchone()
+        improved = improved_row["c"] if improved_row else 0
+    except Exception:
+        # Database might not be initialized yet
+        total = running = completed = failed = improved = 0
     best = get_best_experiment(direction)
     return {
         "total": total,
