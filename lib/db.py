@@ -247,6 +247,41 @@ def get_global(key, default=None):
     return default
 
 
+def try_acquire_oof_lock(experiment_name: str, owner: str = "") -> bool:
+    """Atomically acquire OOF lock for experiment. Returns True if acquired."""
+    db = get_db()
+    key = f"oof_lock:{experiment_name}"
+    value = owner or datetime.now().isoformat()
+    with _lock:
+        cur = db.execute(
+            "INSERT OR IGNORE INTO global_state (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        db.commit()
+        return cur.rowcount == 1
+
+
+def release_oof_lock(experiment_name: str):
+    db = get_db()
+    key = f"oof_lock:{experiment_name}"
+    with _lock:
+        db.execute("DELETE FROM global_state WHERE key = ?", (key,))
+        db.commit()
+
+
+def get_oof_lock_owner(experiment_name: str):
+    return get_global(f"oof_lock:{experiment_name}")
+
+
+def list_global_keys(prefix: str = "") -> list[str]:
+    db = get_db()
+    if prefix:
+        rows = db.execute("SELECT key FROM global_state WHERE key LIKE ?", (f"{prefix}%",)).fetchall()
+    else:
+        rows = db.execute("SELECT key FROM global_state").fetchall()
+    return [str(r["key"]) for r in rows]
+
+
 def get_stats(direction="DESC"):
     db = get_db()
     total = db.execute("SELECT COUNT(*) as c FROM experiments").fetchone()["c"]

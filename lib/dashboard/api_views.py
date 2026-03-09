@@ -13,7 +13,51 @@ def build_state_payload(rt):
     direction = rt.cfg.best_score_sort_key()
     stats = db.get_stats(direction)
     # Keep /api/state fast: this endpoint is polled frequently by the UI.
-    exps = db.get_dashboard_experiments(limit=500)
+    all_dashboard_exps = db.get_dashboard_experiments(limit=2000)
+    exps = [
+        e for e in all_dashboard_exps
+        if e.get("status") != "cancelled"
+        and (e.get("task_type") != "oof_fold" or e.get("status") == "running")
+    ]
+    oof_by_parent = {}
+    for e in all_dashboard_exps:
+        if e.get("task_type") != "oof_fold":
+            continue
+        parent = e.get("parent_experiment", "") or ""
+        if not parent:
+            continue
+        st = e.get("status") or "queued"
+        bucket = oof_by_parent.setdefault(
+            parent,
+            {
+                "total": 0,
+                "queued": 0,
+                "running": 0,
+                "completed": 0,
+                "failed": 0,
+                "folds": [],
+            },
+        )
+        bucket["total"] += 1
+        if st in ("queued", "running", "completed", "failed"):
+            bucket[st] += 1
+        else:
+            bucket["queued"] += 1
+        bucket["folds"].append(
+            {
+                "name": e.get("name"),
+                "status": st,
+                "gpu_id": e.get("gpu_id"),
+                "cv_score": e.get("cv_score"),
+                "elapsed_min": e.get("elapsed_min"),
+                "created_at": e.get("created_at"),
+            }
+        )
+
+    for parent, bucket in oof_by_parent.items():
+        folds = sorted(bucket["folds"], key=lambda x: x.get("created_at") or "", reverse=True)
+        bucket["folds"] = folds[:12]
+        bucket["left"] = max(bucket["total"] - bucket["completed"], 0)
 
     def _exp_sort_key(e):
         status = e.get("status", "")
@@ -66,6 +110,7 @@ def build_state_payload(rt):
         "base_solution": str(rt.cfg.solutions_dir / "baseline"),
         "timeout_minutes": rt.cfg.timeout_minutes,
         "stats": stats,
+        "oof_progress": oof_by_parent,
     }
 
 
@@ -143,7 +188,10 @@ def build_graph_payload():
 
 
 def read_events(rt, exp_name):
-    events_path = rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
+    exp_dir = rt.cfg.experiments_dir / exp_name
+    events_path = exp_dir / "events" / "events.jsonl"
+    if not events_path.exists():
+        events_path = exp_dir / "output" / "events.jsonl"
     if not events_path.exists():
         return {"events": [], "raw_lines": 0}
 

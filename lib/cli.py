@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -76,11 +77,25 @@ def cmd_run(args):
         queued_exps.sort(key=lambda e: e.get("created_at", ""))
         manual_count = auto_count = 0
         for exp in queued_exps:
+            task_type = exp.get("task_type", "experiment") or "experiment"
             item = {
                 "id": exp["name"],
                 "prompt": exp.get("prompt", ""),
                 "base_solution": exp.get("base_solution", "") or str(cfg.solutions_dir / "baseline"),
+                "task_type": task_type,
             }
+            if task_type == "oof_fold":
+                parent_exp = exp.get("parent_experiment", "") or ""
+                fold_idx = 0
+                m = re.search(r"_f(\d+)(?:_|$)", exp["name"])
+                if m:
+                    fold_idx = int(m.group(1))
+                item.update({
+                    "parent_experiment": parent_exp,
+                    "fold_idx": fold_idx,
+                    "n_folds": int(cfg.stacking_oof_folds),
+                    "oof_runner_path": str(cfg.experiments_dir / parent_exp / "oof_runner.py"),
+                })
             is_auto = exp["name"].startswith("auto_")
             if is_auto:
                 item["auto"] = True

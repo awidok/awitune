@@ -278,6 +278,24 @@ def api_worker_stop():
     return jsonify({"status": "stopped"})
 
 
+@app.route("/api/oof/<exp_name>", methods=["POST"])
+def api_oof(exp_name):
+    exp = db.get_experiment(exp_name)
+    if not exp:
+        return jsonify({"status": "error", "message": "Experiment not found"}), 404
+    if exp.get("task_type") in ("analysis", "oof_fold"):
+        return jsonify({"status": "error", "message": "OOF is available only for model experiments"}), 400
+    result = orch.enqueue_oof_for_experiment(exp_name, manual=True, requester="manual_api")
+    status = result.get("status")
+    if status == "queued":
+        if not rt.worker_running:
+            start_worker()
+        return jsonify(result), 200
+    if status == "already_running":
+        return jsonify(result), 409
+    return jsonify(result), 400
+
+
 @app.route("/api/proxy/start", methods=["POST"])
 def api_proxy_start():
     start_proxy()
@@ -292,10 +310,16 @@ def api_proxy_stop():
 
 @app.route("/api/log/<exp_name>/agent")
 def api_agent_log(exp_name):
-    p = rt.cfg.experiments_dir / exp_name / "agent.log"
-    if p.exists():
-        c = p.read_text(errors="replace")
-        return Response(c[-200_000:] if len(c) > 200_000 else c, mimetype="text/plain")
+    exp_dir = rt.cfg.experiments_dir / exp_name
+    exp = db.get_experiment(exp_name) or {}
+    if exp.get("task_type") == "oof_fold":
+        candidates = [exp_dir / "oof_fold.log", exp_dir / "agent.log"]
+    else:
+        candidates = [exp_dir / "agent.log", exp_dir / "oof_fold.log"]
+    for p in candidates:
+        if p.exists():
+            c = p.read_text(errors="replace")
+            return Response(c[-200_000:] if len(c) > 200_000 else c, mimetype="text/plain")
     return Response("No log", mimetype="text/plain")
 
 

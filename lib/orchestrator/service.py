@@ -34,26 +34,15 @@ class OrchestratorService:
         self.proxy_host = proxy_host
         self.openai_api_key = openai_api_key
         self.orchestrator_log = orchestrator_log
+        self._gpu_numa_affinity = self._detect_gpu_numa_affinity()
 
     def _notify(self, message: str, parse_mode: str = "HTML"):
         send_telegram_notification(self.rt.cfg, message, parse_mode=parse_mode)
 
     def trim_auto_queue(self, max_size: int = MAX_AUTO_QUEUE_SIZE) -> int:
-        removed = []
-        with self.rt.lock:
-            while len(self.rt.auto_queue) > max_size:
-                removed.append(self.rt.auto_queue.pop())
-
-        for item in removed:
-            exp_id = item.get("id", "")
-            if not exp_id:
-                continue
-            db.update_experiment(exp_id, status="cancelled", notes=f"Auto queue trimmed to {max_size}")
-            db.add_log(exp_id, f"Removed from auto-queue (limit {max_size})", level="warning")
-
-        if removed:
-            self.orchestrator_log(f"Trimmed auto queue: removed {len(removed)} item(s), kept {max_size}")
-        return len(removed)
+        # Deprecated: do not cancel queued tasks anymore.
+        # We now cap auto additions before enqueueing new ideas.
+        return 0
 
     def start_proxy(self):
         runtime_start_proxy(self.rt, self.awitune_dir, self.proxy_host)
@@ -70,6 +59,94 @@ class OrchestratorService:
         except PermissionError:
             subprocess.run(["chmod", "-R", "u+rwX", str(path)], capture_output=True, timeout=30)
             shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _parse_cpu_set(cpu_set: str) -> list[int]:
+        values = []
+        for part in str(cpu_set or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                values.extend(range(int(a), int(b) + 1))
+            else:
+                values.append(int(part))
+        return sorted(set(values))
+
+    @staticmethod
+    def _compress_cpu_set(values: list[int]) -> str:
+        if not values:
+            return ""
+        values = sorted(set(values))
+        ranges = []
+        start = prev = values[0]
+        for v in values[1:]:
+            if v == prev + 1:
+                prev = v
+                continue
+            ranges.append(f"{start}-{prev}" if start != prev else str(start))
+            start = prev = v
+        ranges.append(f"{start}-{prev}" if start != prev else str(start))
+        return ",".join(ranges)
+
+    def _detect_gpu_numa_affinity(self) -> dict[int, dict]:
+        mapping: dict[int, dict] = {}
+        line_re = re.compile(r"^GPU(\d+)\s+.*?\s+(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)\s+(\d+)\s+")
+        try:
+            r = subprocess.run(["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                return mapping
+            for raw in r.stdout.splitlines():
+                line = raw.strip()
+                m = line_re.match(line)
+                if not m:
+                    continue
+                gpu_id = int(m.group(1))
+                cpu_affinity = m.group(2)
+                numa_affinity = m.group(3)
+                mapping[gpu_id] = {
+                    "cpu_affinity": cpu_affinity,
+                    "numa_affinity": numa_affinity,
+                }
+        except Exception:
+            return {}
+        return mapping
+
+    def _docker_numa_args(self, gpu_id: int, slot_index: int) -> list[str]:
+        info = self._gpu_numa_affinity.get(int(gpu_id))
+        if not info:
+            return []
+        cpus = self._parse_cpu_set(info.get("cpu_affinity", ""))
+        if not cpus:
+            return []
+        slots = int(self.rt.cfg.slots_per_gpu) if self.rt.cfg and self.rt.cfg.slots_per_gpu else 1
+        slots = max(1, slots)
+        idx = max(0, min(int(slot_index), slots - 1))
+        chunk = max(1, len(cpus) // slots)
+        start = idx * chunk
+        end = (idx + 1) * chunk if idx < (slots - 1) else len(cpus)
+        selected = cpus[start:end]
+        cpuset = self._compress_cpu_set(selected) or info.get("cpu_affinity", "")
+        args = ["--cpuset-cpus", cpuset]
+        numa = str(info.get("numa_affinity", "")).strip()
+        if numa.isdigit():
+            args += ["--cpuset-mems", numa]
+        return args
+
+    @staticmethod
+    def _events_file(exp_dir: Path) -> Path:
+        return exp_dir / "events" / "events.jsonl"
+
+    @staticmethod
+    def _legacy_events_file(out_dir: Path) -> Path:
+        return out_dir / "events.jsonl"
+
+    def _has_result_event_any(self, exp_dir: Path, out_dir: Path) -> bool:
+        primary = self._events_file(exp_dir)
+        if has_result_event(primary):
+            return True
+        return has_result_event(self._legacy_events_file(out_dir))
 
     def _cleanup_post_result_processes(self, exp_name: str, container_name: str) -> bool:
         """Stop known background tail/watch loops that can keep container alive after result."""
@@ -196,6 +273,10 @@ class OrchestratorService:
             cn = f"agent-{exp_name}-gpu{gpu_id}"
             db.update_experiment(exp_name, container_name=cn)
             out = exp_dir / "output"
+            events_dir = exp_dir / "events"
+            events_dir.mkdir(parents=True, exist_ok=True)
+            slot_index = int((task_payload or {}).get("slot_index", 0) or 0)
+            numa_args = self._docker_numa_args(gpu_id, slot_index)
 
             proxy_port = cfg.proxy_port
             cmd = self.docker_cmd + [
@@ -206,6 +287,7 @@ class OrchestratorService:
                 cn,
                 "--gpus",
                 f"device={gpu_id}",
+            ] + numa_args + [
                 "--ulimit",
                 "core=0",
                 "-v",
@@ -214,6 +296,8 @@ class OrchestratorService:
                 f"{ws}:/app/workspace",
                 "-v",
                 f"{out}:/app/output",
+                "-v",
+                f"{events_dir}:/app/events",
                 "-v",
                 f"{exp_dir/'CLAUDE.md'}:/app/CLAUDE.md:ro",
                 "-v",
@@ -249,7 +333,7 @@ class OrchestratorService:
 
             db.add_log(exp_name, f"Docker command: {' '.join(cmd[:10])}...")
             lp = exp_dir / "agent.log"
-            events_file = out / "events.jsonl"
+            events_file = self._events_file(exp_dir)
             grace_period = 180
             with open(lp, "w") as lf:
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -269,7 +353,7 @@ class OrchestratorService:
                         proc.wait(timeout=60)
                         ec = -1
                         break
-                    if agent_done_at is None and has_result_event(events_file):
+                    if agent_done_at is None and self._has_result_event_any(exp_dir, out):
                         agent_done_at = time.time()
                         db.add_log(exp_name, "Agent finished, waiting for container to exit...")
                         if self._cleanup_post_result_processes(exp_name, cn):
@@ -718,59 +802,213 @@ def main():
         raise RuntimeError("run.py did not produce val_predictions.parquet")
     (output_dir / "oof_fold_predictions.parquet").write_bytes(val_pred.read_bytes())
 
+    submit_pred = run_output / "submission.parquet"
+    if submit_pred.exists():
+        (output_dir / "submission_fold.parquet").write_bytes(submit_pred.read_bytes())
+
+    test_pred = run_output / "test_predictions.parquet"
+    if test_pred.exists():
+        (output_dir / "test_fold_predictions.parquet").write_bytes(test_pred.read_bytes())
+
 
 if __name__ == "__main__":
     main()
 """
 
-    def _enqueue_external_oof_folds_for_source(self, parent_exp_name: str, requester: str = ""):
+    def _has_active_oof_jobs(self, parent_exp_name: str) -> bool:
+        all_exps = db.get_all_experiments(limit=5000)
+        for exp in all_exps:
+            if exp.get("task_type") != "oof_fold":
+                continue
+            if exp.get("parent_experiment") != parent_exp_name:
+                continue
+            if exp.get("status") in ("queued", "running"):
+                return True
+        return False
+
+    @staticmethod
+    def _extract_oof_fold_idx(parent_exp_name: str, exp_name: str):
+        pattern = rf"^oof_{re.escape(parent_exp_name)}_f(\d+)(?:_|$)"
+        m = re.match(pattern, exp_name or "")
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _list_parent_oof_experiments(self, parent_exp_name: str):
+        all_exps = db.get_all_experiments(limit=5000)
+        return [
+            e for e in all_exps
+            if e.get("task_type") == "oof_fold" and e.get("parent_experiment") == parent_exp_name
+        ]
+
+    def _drop_oof_queue_items(self, parent_exp_name: str, keep_ids: set[str] | None = None):
+        keep_ids = keep_ids or set()
+        with self.rt.lock:
+            self.rt.manual_queue = type(self.rt.manual_queue)(
+                item for item in self.rt.manual_queue
+                if not (
+                    item.get("task_type") == "oof_fold"
+                    and item.get("parent_experiment") == parent_exp_name
+                    and item.get("id") not in keep_ids
+                )
+            )
+            self.rt.auto_queue = type(self.rt.auto_queue)(
+                item for item in self.rt.auto_queue
+                if not (
+                    item.get("task_type") == "oof_fold"
+                    and item.get("parent_experiment") == parent_exp_name
+                    and item.get("id") not in keep_ids
+                )
+            )
+
+    def _prepare_inplace_oof_slots(self, parent_exp_name: str, n_folds: int, parent_workspace: str):
+        parent_oof = self._list_parent_oof_experiments(parent_exp_name)
+        by_fold_idx = {}
+        extras = []
+        for exp in sorted(parent_oof, key=lambda e: e.get("created_at") or "", reverse=True):
+            name = str(exp.get("name") or "")
+            fold_idx = self._extract_oof_fold_idx(parent_exp_name, name)
+            if fold_idx is None or fold_idx < 0 or fold_idx >= n_folds:
+                extras.append(name)
+                continue
+            if fold_idx not in by_fold_idx:
+                by_fold_idx[fold_idx] = exp
+            else:
+                extras.append(name)
+
+        for exp_name in extras:
+            db.delete_experiment(exp_name)
+
+        slots: list[tuple[int, str]] = []
+        for fold_idx in range(n_folds):
+            existing = by_fold_idx.get(fold_idx)
+            if existing:
+                eid = str(existing.get("name") or "")
+            else:
+                eid = f"oof_{parent_exp_name}_f{fold_idx}"
+                db.create_experiment(
+                    eid,
+                    prompt=f"External OOF fold {fold_idx}/{n_folds - 1} for {parent_exp_name}",
+                    base_solution=parent_workspace,
+                    parent_experiment=parent_exp_name,
+                    task_type="oof_fold",
+                )
+            db.update_experiment(
+                eid,
+                status="queued",
+                started_at=None,
+                finished_at=None,
+                exit_code=None,
+                elapsed_min=None,
+                gpu_id=None,
+                container_name=None,
+                container_id=None,
+                val_score=None,
+                test_score=None,
+                cv_score=None,
+                improved=0,
+                notes="",
+                eval_json=None,
+                parent_experiment=parent_exp_name,
+                task_type="oof_fold",
+            )
+            slots.append((fold_idx, eid))
+        return slots
+
+    def enqueue_oof_for_experiment(self, parent_exp_name: str, manual: bool = True, requester: str = "manual") -> dict:
+        return self._enqueue_external_oof_folds_for_source(
+            parent_exp_name=parent_exp_name,
+            requester=requester,
+            manual=manual,
+        )
+
+    def _enqueue_external_oof_folds_for_source(self, parent_exp_name: str, requester: str = "", manual: bool = False) -> dict:
         parent = db.get_experiment(parent_exp_name) or {}
         if not parent.get("workspace_dir"):
             if requester:
                 db.add_log(requester, f"Cannot queue OOF for {parent_exp_name}: missing workspace", level="warning")
-            return
-        existing = db.get_all_experiments(limit=3000)
-        existing_for_parent_active = [
-            e for e in existing if e.get("task_type") == "oof_fold" and e.get("parent_experiment") == parent_exp_name
-            and e.get("status") in ("queued", "running")
-        ]
-        if existing_for_parent_active:
-            return
+            return {"status": "error", "message": "missing workspace"}
 
-        parent_dir = self.rt.cfg.experiments_dir / parent_exp_name
-        oof_runner_path = parent_dir / "oof_runner.py"
-        oof_runner_path.write_text(self._build_oof_runner_script())
+        if self._has_active_oof_jobs(parent_exp_name):
+            return {"status": "already_running", "message": "OOF already queued/running"}
 
-        n_folds = int(self.rt.cfg.stacking_oof_folds)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        for fold_idx in range(n_folds):
-            eid = f"oof_{parent_exp_name}_f{fold_idx}_{ts}"
-            db.create_experiment(
-                eid,
-                prompt=f"External OOF fold {fold_idx}/{n_folds - 1} for {parent_exp_name}",
-                base_solution=str(parent.get("workspace_dir", "")),
-                parent_experiment=parent_exp_name,
-                task_type="oof_fold",
+        if db.get_oof_lock_owner(parent_exp_name) and not self._has_active_oof_jobs(parent_exp_name):
+            # stale lock after restart/crash
+            db.release_oof_lock(parent_exp_name)
+
+        owner = requester or ("manual" if manual else "stacking_dependency")
+        if not db.try_acquire_oof_lock(parent_exp_name, owner=owner):
+            return {"status": "already_running", "message": "OOF lock is already acquired"}
+
+        try:
+            if not manual:
+                with self.rt.lock:
+                    queued_auto = len(self.rt.auto_queue)
+                if queued_auto >= MAX_AUTO_QUEUE_SIZE:
+                    db.release_oof_lock(parent_exp_name)
+                    return {"status": "deferred", "message": f"auto queue is full ({queued_auto}/{MAX_AUTO_QUEUE_SIZE})"}
+
+            parent_dir = self.rt.cfg.experiments_dir / parent_exp_name
+            oof_runner_path = parent_dir / "oof_runner.py"
+            oof_runner_path.write_text(self._build_oof_runner_script())
+
+            n_folds = int(self.rt.cfg.stacking_oof_folds)
+            parent_workspace = str(parent.get("workspace_dir", ""))
+            slots = self._prepare_inplace_oof_slots(parent_exp_name, n_folds, parent_workspace)
+            keep_ids = {eid for _, eid in slots}
+            self._drop_oof_queue_items(parent_exp_name, keep_ids=keep_ids)
+
+            for fold_idx, eid in slots:
+                db.add_log(
+                    eid,
+                    f"Queued external OOF fold {fold_idx + 1}/{n_folds} for {parent_exp_name}"
+                    + (f" (requested by {requester})" if requester else ""),
+                )
+                item = {
+                    "id": eid,
+                    "prompt": "",
+                    "base_solution": parent_workspace,
+                    "task_type": "oof_fold",
+                    "auto": not manual,
+                    "parent_experiment": parent_exp_name,
+                    "fold_idx": fold_idx,
+                    "n_folds": n_folds,
+                    "oof_runner_path": str(oof_runner_path),
+                }
+                with self.rt.lock:
+                    if manual:
+                        self.rt.manual_queue.append(item)
+                    else:
+                        self.rt.auto_queue.append(item)
+            self.orchestrator_log(
+                f"Queued {n_folds} external OOF fold task(s) for {parent_exp_name} "
+                f"(queue={'manual' if manual else 'auto'})"
             )
-            db.add_log(
-                eid,
-                f"Queued external OOF fold {fold_idx + 1}/{n_folds} for {parent_exp_name}"
-                + (f" (requested by {requester})" if requester else ""),
-            )
-            item = {
-                "id": eid,
-                "prompt": "",
-                "base_solution": str(parent.get("workspace_dir", "")),
-                "task_type": "oof_fold",
-                "auto": True,
-                "parent_experiment": parent_exp_name,
-                "fold_idx": fold_idx,
-                "n_folds": n_folds,
-                "oof_runner_path": str(oof_runner_path),
-            }
-            with self.rt.lock:
-                self.rt.auto_queue.append(item)
-        self.orchestrator_log(f"Queued {n_folds} external OOF fold task(s) for {parent_exp_name}")
+            return {"status": "queued", "count": n_folds}
+        except Exception as exc:
+            db.release_oof_lock(parent_exp_name)
+            return {"status": "error", "message": f"Failed to queue OOF: {exc}"}
+
+    def _release_oof_lock_if_done(self, parent_exp_name: str):
+        if not parent_exp_name:
+            return
+        if self._has_active_oof_jobs(parent_exp_name):
+            return
+        if db.get_oof_lock_owner(parent_exp_name):
+            db.release_oof_lock(parent_exp_name)
+            db.add_log(parent_exp_name, "Released OOF lock")
+
+    def _cleanup_stale_oof_locks(self):
+        for key in db.list_global_keys("oof_lock:"):
+            parent_exp = key.replace("oof_lock:", "", 1)
+            if not parent_exp:
+                continue
+            if not self._has_active_oof_jobs(parent_exp):
+                db.release_oof_lock(parent_exp)
+                db.add_log(parent_exp, "Released stale OOF lock", level="warning")
 
     def _ensure_stacking_dependencies(self, item: dict) -> bool:
         if item.get("task_type") != "stacking":
@@ -786,7 +1024,13 @@ if __name__ == "__main__":
             if self._has_ready_oof_for_experiment(source_exp):
                 continue
             missing.append(source_exp)
-            self._enqueue_external_oof_folds_for_source(source_exp, requester=item["id"])
+            enqueue_result = self._enqueue_external_oof_folds_for_source(source_exp, requester=item["id"], manual=False)
+            if enqueue_result.get("status") not in ("queued", "already_running", "deferred"):
+                db.add_log(
+                    item["id"],
+                    f"Could not queue OOF dependency {source_exp}: {enqueue_result.get('message', 'unknown error')}",
+                    level="warning",
+                )
 
         if missing:
             db.add_log(
@@ -815,13 +1059,20 @@ if __name__ == "__main__":
             return
 
         parts = []
+        submit_parts = []
         fold_cv_scores = []
         for e in fold_exps:
-            fp = self.rt.cfg.experiments_dir / e["name"] / "output" / "oof_fold_predictions.parquet"
+            fold_output = self.rt.cfg.experiments_dir / e["name"] / "output"
+            fp = fold_output / "oof_fold_predictions.parquet"
             if fp.exists():
-                parts.append(pl.read_parquet(str(fp)))
+                oof_df = pl.read_parquet(str(fp))
+                parts.append(oof_df)
             if isinstance(e.get("cv_score"), (int, float)):
                 fold_cv_scores.append(float(e["cv_score"]))
+            submit_fp = fold_output / "submission_fold.parquet"
+            if submit_fp.exists():
+                submit_df = pl.read_parquet(str(submit_fp))
+                submit_parts.append((e["name"], submit_df))
         if len(parts) < n_folds:
             return
 
@@ -833,6 +1084,28 @@ if __name__ == "__main__":
         parent_out.mkdir(parents=True, exist_ok=True)
         final_oof = parent_out / "oof_predictions.parquet"
         merged.write_parquet(str(final_oof))
+
+        if submit_parts:
+            submit_dir = parent_out / "submission_folds"
+            submit_dir.mkdir(parents=True, exist_ok=True)
+            aligned = []
+            for fold_name, df in submit_parts:
+                per_fold_path = submit_dir / f"{fold_name}.parquet"
+                df.write_parquet(str(per_fold_path))
+                aligned.append(df)
+            if aligned:
+                base = aligned[0].clone()
+                pred_cols = [c for c in base.columns if c.startswith("predict_")]
+                if pred_cols:
+                    for col in pred_cols:
+                        col_sum = None
+                        for df in aligned:
+                            expr = pl.col(col)
+                            col_sum = expr if col_sum is None else (col_sum + expr)
+                        base = base.with_columns((col_sum / len(aligned)).alias(col))
+                    base.write_parquet(str(parent_out / "submission_oof_mean.parquet"))
+                db.add_log(parent_exp_name, f"Saved per-fold submit predictions: {len(aligned)} fold file(s)")
+
         parent = db.get_experiment(parent_exp_name) or {}
         self._register_oof_predictions(parent_exp_name, parent_out, parent.get("test_score"))
         if fold_cv_scores:
@@ -845,8 +1118,18 @@ if __name__ == "__main__":
         cfg = self.rt.cfg
         exp_dir = cfg.experiments_dir / exp_name
         exp_dir.mkdir(parents=True, exist_ok=True)
+        log_path = exp_dir / "oof_fold.log"
         out = exp_dir / "output"
+        if out.exists():
+            try:
+                subprocess.run(["chmod", "-R", "a+rwX", str(out)], capture_output=True, timeout=15)
+            except Exception:
+                pass
         out.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(out, 0o777)
+        except Exception:
+            pass
 
         parent_exp = str(task_payload.get("parent_experiment") or "")
         fold_idx = int(task_payload.get("fold_idx", 0))
@@ -863,7 +1146,13 @@ if __name__ == "__main__":
             if not parent_ws.exists() or not (parent_ws / "run.py").exists():
                 raise RuntimeError(f"Parent workspace/run.py not found for {parent_exp}")
             if not runner_path.exists():
-                raise RuntimeError(f"OOF runner script not found: {runner_path}")
+                if parent_exp:
+                    parent_dir = cfg.experiments_dir / parent_exp
+                    parent_dir.mkdir(parents=True, exist_ok=True)
+                    runner_path = parent_dir / "oof_runner.py"
+                    runner_path.write_text(self._build_oof_runner_script())
+                else:
+                    raise RuntimeError(f"OOF runner script not found: {runner_path}")
 
             cn = f"oof-{exp_name}-gpu{gpu_id}"[:120]
             cmd = self.docker_cmd + [
@@ -874,6 +1163,9 @@ if __name__ == "__main__":
                 cn,
                 "--gpus",
                 f"device={gpu_id}",
+            ] + self._docker_numa_args(gpu_id, int(task_payload.get("slot_index", 0) or 0)) + [
+                "--user",
+                "0:0",
                 "--entrypoint",
                 "python",
                 "-v",
@@ -898,8 +1190,15 @@ if __name__ == "__main__":
                 str(n_folds),
             ]
 
-            log_path = exp_dir / "oof_fold.log"
-            with open(log_path, "w") as lf:
+            with open(log_path, "w", encoding="utf-8") as lf:
+                lf.write(f"[{datetime.now().isoformat()}] OOF launch\n")
+                lf.write(f"experiment: {exp_name}\n")
+                lf.write(f"container: {cn}\n")
+                lf.write(f"gpu: {gpu_id}\n")
+                lf.write(f"fold: {fold_idx + 1}/{n_folds}\n")
+                lf.write(f"command: {' '.join(cmd)}\n")
+                lf.write("-" * 80 + "\n")
+                lf.flush()
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
                 deadline = time.time() + cfg.timeout_minutes * 60
                 while True:
@@ -908,11 +1207,16 @@ if __name__ == "__main__":
                         exit_code = ret
                         break
                     if time.time() > deadline:
+                        lf.write(f"\n[{datetime.now().isoformat()}] TIMEOUT reached, stopping container {cn}\n")
+                        lf.flush()
                         subprocess.run(self.docker_cmd + ["stop", "-t", "30", cn], capture_output=True, timeout=60)
                         proc.wait(timeout=60)
                         exit_code = -1
                         break
                     time.sleep(5)
+                elapsed_min = (time.time() - t0) / 60
+                lf.write(f"\n[{datetime.now().isoformat()}] OOF finished with exit_code={exit_code}, elapsed={elapsed_min:.2f} min\n")
+                lf.flush()
 
             oof_pred = out / "oof_fold_predictions.parquet"
             status = "completed" if exit_code == 0 and oof_pred.exists() else "failed"
@@ -942,7 +1246,13 @@ if __name__ == "__main__":
             db.add_log(exp_name, f"OOF fold finished with status={status}, exit={exit_code}")
             if status == "completed" and parent_exp:
                 self._aggregate_parent_oof(parent_exp)
+            self._release_oof_lock_if_done(parent_exp)
         except Exception as exc:
+            try:
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"\n[{datetime.now().isoformat()}] OOF ERROR: {exc}\n")
+            except Exception:
+                pass
             db.update_experiment(
                 exp_name,
                 status="failed",
@@ -952,18 +1262,23 @@ if __name__ == "__main__":
                 notes=f"OOF ERROR: {exc}",
             )
             db.add_log(exp_name, f"OOF ERROR: {exc}", level="error")
+            self._release_oof_lock_if_done(parent_exp)
         finally:
             with self.rt.lock:
                 self.rt.remove_experiment_from_gpu(gpu_id, exp_name)
 
     def worker_loop(self):
         last_sync_at = 0.0
+        last_oof_cleanup_at = 0.0
         while self.rt.worker_running:
             try:
                 now = time.time()
                 if now - last_sync_at >= 15:
                     self.rt.sync_running_from_docker()
                     last_sync_at = now
+                if now - last_oof_cleanup_at >= 30:
+                    self._cleanup_stale_oof_locks()
+                    last_oof_cleanup_at = now
 
                 started_any = False
                 blocked_in_cycle = 0
@@ -1000,6 +1315,7 @@ if __name__ == "__main__":
                                 self.rt.manual_queue.appendleft(item)
                             break
                         self.rt.add_experiment_to_gpu(gpu, item["id"])
+                        item["slot_index"] = max(0, len(self.rt.running_gpus.get(gpu, [])) - 1)
 
                     threading.Thread(
                         target=self.run_agent_in_thread,
@@ -1015,7 +1331,6 @@ if __name__ == "__main__":
                     time.sleep(0.5)
 
                 if not started_any:
-                    self.trim_auto_queue(MAX_AUTO_QUEUE_SIZE)
                     with self.rt.lock:
                         if len(self.rt.auto_queue) > 0:
                             time.sleep(2)
@@ -1086,6 +1401,18 @@ if __name__ == "__main__":
                 return cn
         return None
 
+    def _is_claude_active_in_container(self, container_name: str) -> bool:
+        """Return True if claude process is currently running inside container."""
+        try:
+            result = subprocess.run(
+                self.docker_cmd + ["exec", container_name, "sh", "-c", "pgrep -x claude >/dev/null 2>&1"],
+                capture_output=True,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def _finalize_experiment(self, exp_name, best_score):
         cfg = self.rt.cfg
         exp_dir = cfg.experiments_dir / exp_name
@@ -1105,6 +1432,38 @@ if __name__ == "__main__":
             self._finalize_analysis(exp_name, exp_dir, out, (elapsed_min or 0) * 60, None)
             db.add_log(exp_name, "Recovered analyst task after restart")
             return "completed", 0
+        if task_type == "oof_fold":
+            parent_exp = str(exp.get("parent_experiment") or "") if exp else ""
+            oof_pred = out / "oof_fold_predictions.parquet"
+            status = "completed" if oof_pred.exists() else "failed"
+            notes = "recovered OOF after restart" if status == "completed" else "recovered OOF without predictions"
+            fold_cv = None
+            metrics_fp = out / "run_output" / "metrics.json"
+            if metrics_fp.exists():
+                try:
+                    metrics = json.loads(metrics_fp.read_text(errors="replace"))
+                    raw_cv = metrics.get(cfg.val_metric_key)
+                    if isinstance(raw_cv, (int, float)):
+                        fold_cv = float(raw_cv)
+                except Exception:
+                    fold_cv = None
+            recovered_exit_code = exp.get("exit_code") if exp else None
+            if recovered_exit_code is None:
+                recovered_exit_code = 0 if status == "completed" else -3
+            db.update_experiment(
+                exp_name,
+                status=status,
+                finished_at=datetime.now().isoformat(),
+                exit_code=recovered_exit_code,
+                elapsed_min=elapsed_min,
+                notes=notes,
+                cv_score=fold_cv,
+            )
+            db.add_log(exp_name, f"Recovered OOF: {status}, pred_exists={oof_pred.exists()}")
+            if status == "completed" and parent_exp:
+                self._aggregate_parent_oof(parent_exp)
+            self._release_oof_lock_if_done(parent_exp)
+            return status, None
 
         if out.exists():
             run_evaluate(self.rt.cfg, out)
@@ -1131,7 +1490,7 @@ if __name__ == "__main__":
         submission_path = out / "submission.parquet"
         has_submission = submission_path.exists()
         has_eval = bool(ev)
-        has_result = has_result_event(out / "events.jsonl")
+        has_result = self._has_result_event_any(exp_dir, out)
         status = "completed" if (has_eval or has_submission) else "failed"
         if status == "failed":
             if has_result:
@@ -1161,7 +1520,9 @@ if __name__ == "__main__":
     def _monitor_orphaned_container(self, exp_name, container_name, gpu_id):
         stuck_threshold = 600
         post_result_grace = 180
-        events_file = self.rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
+        exp_dir = self.rt.cfg.experiments_dir / exp_name
+        out_dir = exp_dir / "output"
+        events_file = self._events_file(exp_dir)
         agent_done_logged = False
         agent_done_at = None
         last_cleanup_at = 0.0
@@ -1181,7 +1542,17 @@ if __name__ == "__main__":
             except Exception:
                 break
 
-            if not agent_done_logged and has_result_event(events_file):
+            claude_active = self._is_claude_active_in_container(container_name)
+            if not claude_active and self._has_result_event_any(exp_dir, out_dir):
+                db.add_log(
+                    exp_name,
+                    "Recovery: claude process is not active and result is present; finalizing experiment",
+                    level="warning",
+                )
+                self._force_finish_container_after_result(exp_name, container_name)
+                break
+
+            if not agent_done_logged and self._has_result_event_any(exp_dir, out_dir):
                 agent_done_logged = True
                 agent_done_at = time.time()
                 db.add_log(exp_name, "Agent finished (found 'result' in events.jsonl), waiting for container to exit...")
@@ -1209,8 +1580,11 @@ if __name__ == "__main__":
 
     def recover_orphaned_experiments(self):
         try:
-            r = subprocess.run(self.docker_cmd + ["ps", "--filter", "name=agent-", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=5)
-            active_containers = set(r.stdout.strip().split("\n")) if r.stdout.strip() else set()
+            r = subprocess.run(self.docker_cmd + ["ps", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=5)
+            active_containers = {
+                cn for cn in (r.stdout.strip().split("\n") if r.stdout.strip() else set())
+                if cn.startswith("agent-") or cn.startswith("oof-")
+            }
         except Exception:
             active_containers = set()
 
@@ -1224,8 +1598,23 @@ if __name__ == "__main__":
         for exp in running_exps:
             exp_name = exp["name"]
             gpu_id = exp.get("gpu_id")
+            task_type = exp.get("task_type") or "experiment"
             cn = self._find_container_name(exp_name, active_containers)
             if cn:
+                if task_type == "oof_fold":
+                    if gpu_id is not None:
+                        with self.rt.lock:
+                            self.rt.add_experiment_to_gpu(gpu_id, exp_name)
+                    db.add_log(exp_name, f"Resuming monitoring for orphaned OOF fold on GPU {gpu_id}")
+                    threading.Thread(target=self._monitor_orphaned_oof_container, args=(exp_name, cn, gpu_id), daemon=True).start()
+                    monitored += 1
+                    continue
+                exp_dir = self.rt.cfg.experiments_dir / exp_name
+                if not self._is_claude_active_in_container(cn) and self._has_result_event_any(exp_dir, exp_dir / "output"):
+                    db.add_log(exp_name, "Recovery: container found but claude is already inactive; finalizing immediately")
+                    self._finalize_experiment(exp_name, best_score)
+                    recovered += 1
+                    continue
                 if gpu_id is not None:
                     with self.rt.lock:
                         self.rt.add_experiment_to_gpu(gpu_id, exp_name)
@@ -1239,3 +1628,25 @@ if __name__ == "__main__":
             print(f"  Recovered {recovered} orphaned experiment(s)")
         if monitored:
             print(f"  Resumed monitoring for {monitored} experiment(s)")
+
+    def _monitor_orphaned_oof_container(self, exp_name, container_name, gpu_id):
+        db.add_log(exp_name, f"Resumed OOF monitoring (container {container_name})")
+        while True:
+            try:
+                r = subprocess.run(
+                    self.docker_cmd + ["inspect", container_name, "--format", "{{.State.Running}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if r.stdout.strip() != "true":
+                    break
+            except Exception:
+                break
+            time.sleep(10)
+
+        direction = self.rt.cfg.best_score_sort_key()
+        best_score = db.get_stats(direction).get("best_score", 0) or 0
+        self._finalize_experiment(exp_name, best_score)
+        with self.rt.lock:
+            self.rt.remove_experiment_from_gpu(gpu_id, exp_name)

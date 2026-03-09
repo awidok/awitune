@@ -148,12 +148,18 @@ Example format:
 ### GPU Utilization & Efficiency (MANDATORY)
 - Prefer changes that improve **quality per GPU-hour**, not just absolute quality.
 - Keep GPU busy during training: avoid obvious input pipeline stalls, unnecessary CPU bottlenecks, and long idle waits.
+- **Do not rely on artifact reuse/caching shortcuts as the main strategy**. Improve runtime by writing more efficient code paths.
 - Favor compute-efficient techniques that preserve or improve quality:
   - mixed precision (when stable),
-  - efficient dataloading / preprocessing,
-  - reasonable batch sizing for high GPU occupancy without OOM,
+  - efficient dataloading / preprocessing implementation,
+  - batch sizing should prioritize quality/stability (small batches are acceptable when they improve generalization),
+  - minimizing Python overhead in hot loops,
+  - vectorized tensor/dataframe operations instead of slow row-wise logic,
   - avoiding redundant forward passes and repeated full-dataset evaluations.
-- Be mindful of memory and runtime so many experiments can run in parallel on shared infrastructure.
+- Optimize for **system throughput** on shared infrastructure:
+  - avoid expensive CPU-bound preprocessing inside every epoch,
+  - avoid unnecessary data copies/materialization,
+  - keep memory footprint controlled to reduce contention.
 - If two options are similar in expected quality, choose the one with lower runtime / memory footprint.
 
 ### Code Change Rules

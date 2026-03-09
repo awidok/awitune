@@ -10,7 +10,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .dot.g{background:#3fb950}.dot.r{background:#f85149}.dot.y{background:#d29922;animation:p 2s infinite}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
-.lay{display:grid;grid-template-columns:420px 1fr;gap:10px;padding:10px;height:calc(100vh - 48px)}
+.lay{display:grid;grid-template-columns:minmax(320px,36vw) 1fr;gap:10px;padding:10px;height:calc(100vh - 48px)}
 .sb{display:flex;flex-direction:column;gap:10px;overflow:hidden}
 .mn{display:flex;flex-direction:column;gap:10px;overflow:hidden}
 .cd{background:#161b22;border:1px solid #30363d;border-radius:6px;overflow:hidden}
@@ -29,12 +29,16 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 .bt.g{background:#238636;border-color:#2ea043;color:#fff}.bt.g:hover{background:#2ea043}
 .bt.r{background:#da3633;border-color:#f85149;color:#fff}.bt.r:hover{background:#f85149}
 .el{flex:1;overflow-y:auto}
-.ei{padding:7px 10px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:11px}
+.ei{padding:6px 8px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:11px;gap:8px}
 .ei:hover{background:#1c2128}
 .ei.a{background:#1f2937;border-left:3px solid #58a6ff}
-.ei .n{font-weight:500}.ei .m{font-size:10px;color:#8b949e}
+.ei .n{font-weight:500;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ei .m{font-size:10px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .ei .s{font-family:monospace;font-weight:600}
 .s.ok{color:#3fb950}.s.fl{color:#f85149}.s.rn{color:#d29922}
+.ei .left{min-width:0;flex:1}
+.act{display:flex;align-items:center;gap:3px;flex-wrap:nowrap}
+.act .bt{padding:1px 5px;font-size:10px}
 .gb{display:flex;gap:6px}
 .gc{flex:1;padding:6px;border-radius:4px;text-align:center;font-size:10px;font-weight:600}
 .gc.fr{background:#0d1117;border:1px solid #30363d;color:#8b949e}
@@ -50,10 +54,25 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 .mc .v{font-size:18px;font-weight:700;font-family:monospace}.mc .l{font-size:9px;color:#8b949e}
 .fi{padding:5px 10px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;cursor:pointer;font-size:12px}
 .fi:hover{background:#1c2128}.fi .sz{color:#8b949e;font-family:monospace;font-size:10px}
+body.compact .hdr{padding:8px 12px}
+body.compact .lay{gap:8px;padding:8px;grid-template-columns:minmax(280px,31vw) 1fr}
+body.compact .ch{padding:5px 8px;font-size:11px}
+body.compact .cb{padding:6px 8px}
+body.compact .ei{padding:5px 6px;font-size:10px}
+body.compact .ei .m{font-size:9px}
+body.compact .mc{padding:5px 8px;min-width:74px}
+body.compact .mc .v{font-size:15px}
+body.compact .gc{padding:4px 8px}
+body.focus-log .lay{grid-template-columns:0 1fr}
+body.focus-log .sb{display:none}
+body.focus-log .mn{grid-column:1/-1}
+@media (max-width:1280px){.lay{grid-template-columns:minmax(280px,34vw) 1fr}.ei .m{font-size:9px}.act .bt{padding:1px 4px}}
 </style></head><body>
 <div class="hdr"><h1>🤖 Agent Orchestrator</h1>
 <div class="ctl">
 <span id="ps"></span><span id="ws"></span><span id="afs"></span>
+<button class="bt" onclick="tc()" id="cbt">🗜 Compact</button>
+<button class="bt" onclick="tf()" id="fbt">↔ Focus Log</button>
 <button class="bt" onclick="tw()" id="wb">Start Worker</button>
 <button class="bt" onclick="tp()" id="pb">Start Proxy</button>
 <a href="/graph" class="bt" style="text-decoration:none;font-size:10px">📊 Graph</a>
@@ -87,6 +106,24 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e
 </div></div>
 <script>
 let sel=null,tab='agent',viewingFile=false;
+
+function getSelectedExperimentFromUrl(){
+    try{
+        const u=new URL(window.location.href);
+        return u.searchParams.get('exp');
+    }catch(e){
+        return null;
+    }
+}
+
+function setSelectedExperimentInUrl(name){
+    try{
+        const u=new URL(window.location.href);
+        if(name)u.searchParams.set('exp',name);
+        else u.searchParams.delete('exp');
+        window.history.replaceState({},'',u.toString());
+    }catch(e){}
+}
 
 function fmtElapsed(startedAt){
     if(!startedAt)return '...';
@@ -164,12 +201,14 @@ async function rf(){
 
         // Experiments (from DB history + running)
         let exps = d.history || [];
+        const oofMap = d.oof_progress || {};
         document.getElementById('ec').textContent=`(${exps.length})`;
 
         document.getElementById('el').innerHTML=exps.map(e=>{
             const active=sel===e.name?'a':'';
-            let sc='fl',sv='N/A';
-            let cv='N/A';
+            const isAnalysis = e.task_type === 'analysis';
+            let sc='fl',sv=isAnalysis?'—':'N/A';
+            let cv=isAnalysis?'—':'N/A';
             const gpu = e.gpu_id ?? e.gpu ?? '?';
             if(e.status==='running'){sc='rn';sv='⏳'}
             else if(e.test_score && e.test_score > 0){
@@ -191,17 +230,26 @@ async function rf(){
             const stopBtn=e.status==='running'?`<button class="bt r" onclick="event.stopPropagation();ke('${e.name}')" style="padding:1px 6px;font-size:10px" title="Stop">⏹</button>`:'';
             const forkBtn=e.status==='completed'&&e.test_score&&e.task_type!=='analysis'?`<button class="bt" onclick="event.stopPropagation();fk('${e.name}')" style="padding:1px 6px;font-size:10px" title="Fork — use as base for new experiment">🍴</button>`:'';
             const restartBtn=e.status!=='running'&&e.status!=='queued'?`<button class="bt" onclick="event.stopPropagation();re('${e.name}')" style="padding:1px 6px;font-size:10px" title="Restart">🔄</button>`:'';
+            const cvBtn=e.task_type!=='analysis'&&e.task_type!=='oof_fold'?`<button class="bt" onclick="event.stopPropagation();cv('${e.name}')" style="padding:1px 6px;font-size:10px" title="Compute CV / OOF">🧮</button>`:'';
             const delBtn=`<button class="bt" onclick="event.stopPropagation();de('${e.name}')" style="padding:1px 6px;font-size:10px;margin-left:2px" title="Delete">🗑</button>`;
             const parentTag=e.parent_experiment?`<span style="color:#58a6ff;font-size:9px" title="Based on ${e.parent_experiment}">← ${e.parent_experiment.slice(0,20)}</span>`:'';
             const ttBadge=e.task_type==='analysis'?'<span style="background:#1f6feb;color:#fff;padding:0 4px;border-radius:3px;font-size:9px;margin-right:4px">🔍</span>':'';
+            const cvChunk=isAnalysis?'':` · CV ${cv}`;
+            const oof = oofMap[e.name];
+            const oofChunk = oof ? ` · OOF ${oof.running}▶ / ${oof.left} left` : '';
             return `<div class="ei ${active}" onclick="se('${e.name}')">
-                <div><div class="n">${ttBadge}${e.name}</div>
-                <div class="m">GPU ${gpu} · ${timeStr} · CV ${cv} ${parentTag}</div></div>
-                <div style="display:flex;align-items:center;gap:4px">
+                <div class="left"><div class="n" title="${e.name}">${ttBadge}${e.name}</div>
+                <div class="m">GPU ${gpu} · ${timeStr}${cvChunk}${oofChunk} ${parentTag}</div></div>
+                <div class="act">
                     <span class="s ${sc}">${sv}</span>
-                    ${stopBtn}${forkBtn}${restartBtn}${delBtn}
+                    ${stopBtn}${forkBtn}${restartBtn}${cvBtn}${delBtn}
                 </div></div>`;
         }).join('');
+
+        if(sel && !exps.some(e=>e.name===sel)){
+            sel=null;
+            setSelectedExperimentInUrl(null);
+        }
 
         // Auto-select
         if(!sel&&exps.length>0){
@@ -213,6 +261,23 @@ async function rf(){
         if(sel){
             const s=exps.find(e=>e.name===sel);
             if(s){
+                const oof = oofMap[s.name];
+                let oofCard = '';
+                if(oof){
+                    const foldLinks = (oof.folds || []).map(f=>{
+                        const st=f.status||'queued';
+                        const color=st==='completed'?'#3fb950':(st==='running'?'#d29922':(st==='failed'?'#f85149':'#8b949e'));
+                        const cvTxt=(f.cv_score!==null&&f.cv_score!==undefined)?Number(f.cv_score).toFixed(5):'—';
+                        return `<span style="display:inline-flex;gap:4px;align-items:center;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:2px 6px;margin:2px;cursor:pointer" onclick="ofl('${f.name}')">
+                            <span style="color:${color};font-size:10px">●</span><span style="font-size:10px">${(f.name||'').slice(0,28)}</span><span style="color:#8b949e;font-size:10px">cv ${cvTxt}</span>
+                        </span>`;
+                    }).join('');
+                    oofCard = `<div class="mc" style="min-width:300px;text-align:left">
+                        <div class="l">OOF Progress</div>
+                        <div style="font-size:11px;color:#c9d1d9;margin-top:2px">${oof.running} running · ${oof.queued} queued · ${oof.completed} done · ${oof.failed} failed</div>
+                        <div style="margin-top:4px;max-height:70px;overflow:auto">${foldLinks || '<span style="color:#8b949e">No folds yet</span>'}</div>
+                    </div>`;
+                }
                 let timeVal, timeColor='#d29922';
                 if(s.status==='running'){
                     timeVal=fmtElapsed(s.started_at);
@@ -231,6 +296,7 @@ async function rf(){
                     <div class="mc"><div class="v" style="color:${s.exit_code===0?'#3fb950':s.status==='running'?'#d29922':'#f85149'}">${s.status==='running'?'⏳':(s.exit_code??'—')}</div><div class="l">Exit</div></div>
                     ${s.parent_experiment?`<div class="mc" style="min-width:100px"><div class="v" style="font-size:12px;color:#58a6ff;cursor:pointer" onclick="se('${s.parent_experiment}')">← ${s.parent_experiment.slice(0,25)}</div><div class="l">Parent</div></div>`:''}
                     ${s.prompt?`<div class="mc" style="min-width:200px;text-align:left"><div class="l">Prompt</div><div style="font-size:11px;color:#c9d1d9;margin-top:2px">${s.prompt.slice(0,100)}</div></div>`:''}
+                    ${oofCard}
                 `;
             }
         }
@@ -239,7 +305,13 @@ async function rf(){
     if(!viewingFile && (tab==='agent'||tab==='proxy'||tab==='events'||tab==='tasks'||tab==='reports')) lt();
 }
 
-function se(name){sel=name;viewingFile=false;rf();lt()}
+function se(name){
+    sel=name;
+    setSelectedExperimentInUrl(name);
+    viewingFile=false;
+    rf();
+    lt();
+}
 
 async function lt(){
     if(!sel)return;
@@ -440,8 +512,54 @@ async function re(name){
 async function de(name){
     if(!confirm('Delete experiment '+name+'? This cannot be undone.'))return;
     await fetch('/api/delete/'+name,{method:'POST'});
-    if(sel===name)sel=null;
+    if(sel===name){
+        sel=null;
+        setSelectedExperimentInUrl(null);
+    }
     rf();
+}
+
+async function cv(name){
+    if(!confirm('Queue external OOF/CV computation for '+name+'?'))return;
+    try{
+        const r=await fetch('/api/oof/'+name,{method:'POST'});
+        const d=await r.json();
+        if(r.status===409){
+            alert(d.message||'OOF already queued or running');
+        }else if(!r.ok){
+            alert(d.message||'Failed to queue OOF');
+        }else{
+            alert(`Queued ${d.count||0} OOF folds for ${name}`);
+        }
+    }catch(e){
+        alert('Failed to queue OOF: '+e.message);
+    }
+    rf();
+}
+
+async function ofl(name){
+    viewingFile=true;
+    const lc=document.getElementById('lc');
+    try{
+        const r=await fetch(`/api/log/${name}/agent`);
+        const txt=await r.text();
+        lc.innerHTML=`<div style="padding:4px 8px;background:#1c2128;border-bottom:1px solid #30363d;font-size:11px;color:#58a6ff;display:flex;justify-content:space-between">
+            <span>OOF fold log: ${name}</span>
+            <span><button class="bt" onclick="ofl('${name}')" style="padding:1px 8px;font-size:10px">↻ Refresh</button>
+            <button class="bt" onclick="viewingFile=false;lt()" style="padding:1px 8px;font-size:10px">← Back</button></span>
+        </div><pre style="padding:8px;margin:0;white-space:pre-wrap;word-break:break-all;font-size:11px">${txt.replace(/</g,'&lt;')}</pre>`;
+        lc.scrollTop=lc.scrollHeight;
+    }catch(e){lc.textContent='Error: '+e.message}
+}
+
+function tc(){
+    document.body.classList.toggle('compact');
+    localStorage.setItem('dash_compact',document.body.classList.contains('compact')?'1':'0');
+}
+
+function tf(){
+    document.body.classList.toggle('focus-log');
+    localStorage.setItem('dash_focus_log',document.body.classList.contains('focus-log')?'1':'0');
 }
 
 async function showProxyLog(){
@@ -468,5 +586,8 @@ async function showOrchestratorLog(){
     }catch(e){lc.textContent='Error: '+e.message}
 }
 
+if(localStorage.getItem('dash_compact')==='1')document.body.classList.add('compact');
+if(localStorage.getItem('dash_focus_log')==='1')document.body.classList.add('focus-log');
+sel=getSelectedExperimentFromUrl();
 rf();loadBases();setInterval(rf,5000);setInterval(loadBases,15000);
 </script></body></html>

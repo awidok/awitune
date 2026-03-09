@@ -82,7 +82,7 @@ class RuntimeState:
     def sync_running_from_docker(self):
         try:
             r = subprocess.run(
-                self.docker_cmd + ["ps", "--filter", "name=agent-", "--format", "{{.Names}}"],
+                self.docker_cmd + ["ps", "--format", "{{.Names}}"],
                 capture_output=True, text=True, timeout=5
             )
             active_containers = set(r.stdout.strip().split("\n")) if r.stdout.strip() else set()
@@ -92,6 +92,8 @@ class RuntimeState:
                 for cn in active_containers:
                     if not cn:
                         continue
+                    if not (cn.startswith("agent-") or cn.startswith("oof-")):
+                        continue
                     parts = cn.rsplit("-gpu", 1)
                     if len(parts) != 2:
                         continue
@@ -99,9 +101,16 @@ class RuntimeState:
                         gpu = int(parts[1])
                     except ValueError:
                         continue
-                    exp_name = parts[0].replace("agent-", "", 1)
+                    if parts[0].startswith("agent-"):
+                        exp_name = parts[0].replace("agent-", "", 1)
+                    elif parts[0].startswith("oof-"):
+                        exp_name = parts[0].replace("oof-", "", 1)
+                    else:
+                        continue
                     exp = db.get_experiment(exp_name)
-                    if exp and exp.get("status") in ("completed", "failed", "killed", "cancelled"):
+                    if not exp:
+                        zombies_to_kill.append(cn)
+                    elif exp.get("status") in ("completed", "failed", "killed", "cancelled"):
                         zombies_to_kill.append(cn)
                     else:
                         rebuilt_running.setdefault(gpu, [])

@@ -31,7 +31,10 @@ def find_claude_tasks_dir(docker_cmd, container_name):
 
 
 def read_tasks(rt, docker_cmd, exp_name):
-    events_path = rt.cfg.experiments_dir / exp_name / "output" / "events.jsonl"
+    exp_dir = rt.cfg.experiments_dir / exp_name
+    events_path = exp_dir / "events" / "events.jsonl"
+    if not events_path.exists():
+        events_path = exp_dir / "output" / "events.jsonl"
     tasks = {}
     if events_path.exists():
         try:
@@ -173,7 +176,7 @@ def restart_experiment(rt, docker_cmd, force_rmtree, start_worker, exp_name):
             rt.remove_experiment_from_gpu(gpu_id, exp_name)
 
     exp_dir = rt.cfg.experiments_dir / exp_name
-    for subdir in ["output", "workspace"]:
+    for subdir in ["output", "workspace", "events"]:
         dpath = exp_dir / subdir
         if dpath.exists():
             force_rmtree(dpath)
