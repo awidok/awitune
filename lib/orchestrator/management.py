@@ -168,19 +168,45 @@ def restart_experiment(rt, docker_cmd, force_rmtree, start_worker, exp_name):
     if not exp:
         return {"status": "error", "message": "Not found"}, 404
 
-    for gpu in rt.cfg.gpus:
-        subprocess.run(docker_cmd + ["kill", f"agent-{exp_name}-gpu{gpu}"], capture_output=True, timeout=5)
+    task_type = exp.get("task_type", "experiment") or "experiment"
+    
+    # Kill appropriate container based on task type
+    if task_type == "oof_fold":
+        for gpu in rt.cfg.gpus:
+            subprocess.run(docker_cmd + ["kill", f"oof-{exp_name}-gpu{gpu}"], capture_output=True, timeout=5)
+    else:
+        for gpu in rt.cfg.gpus:
+            subprocess.run(docker_cmd + ["kill", f"agent-{exp_name}-gpu{gpu}"], capture_output=True, timeout=5)
 
     with rt.lock:
         for gpu_id in list(rt.running_gpus.keys()):
             rt.remove_experiment_from_gpu(gpu_id, exp_name)
 
     exp_dir = rt.cfg.experiments_dir / exp_name
-    for subdir in ["output", "workspace", "events"]:
-        dpath = exp_dir / subdir
-        if dpath.exists():
-            force_rmtree(dpath)
-        dpath.mkdir(parents=True, exist_ok=True)
+    
+    # Clean up based on task type
+    if task_type == "oof_fold":
+        # For OOF folds: clean output and log, keep workspace reference
+        for subdir in ["output"]:
+            dpath = exp_dir / subdir
+            if dpath.exists():
+                force_rmtree(dpath)
+            dpath.mkdir(parents=True, exist_ok=True)
+        # Clean OOF log
+        oof_log = exp_dir / "oof_fold.log"
+        if oof_log.exists():
+            oof_log.unlink()
+    else:
+        # For regular experiments: clean everything
+        for subdir in ["output", "workspace", "events"]:
+            dpath = exp_dir / subdir
+            if dpath.exists():
+                force_rmtree(dpath)
+            dpath.mkdir(parents=True, exist_ok=True)
+        # Clean agent log
+        agent_log = exp_dir / "agent.log"
+        if agent_log.exists():
+            agent_log.unlink()
 
     prompt = exp.get("prompt", "")
     base = exp.get("base_solution", "") or str(rt.cfg.solutions_dir / "baseline")
@@ -193,13 +219,33 @@ def restart_experiment(rt, docker_cmd, force_rmtree, start_worker, exp_name):
         elapsed_min=None,
         test_score=None,
         val_score=None,
+        cv_score=None,
         improved=0,
         notes="",
         eval_json=None,
     )
     db.add_log(exp_name, "Restarted")
+    
+    # Build queue item with all necessary fields for task type
+    item = {
+        "id": exp_name,
+        "prompt": prompt,
+        "base_solution": base,
+        "task_type": task_type,
+    }
+    
+    # Add OOF-specific fields
+    if task_type == "oof_fold":
+        parent_exp = exp.get("parent_experiment", "")
+        item.update({
+            "parent_experiment": parent_exp,
+            "fold_idx": exp.get("fold_idx", 0),
+            "n_folds": exp.get("n_folds", 5),
+            "oof_runner_path": str(rt.cfg.experiments_dir / parent_exp / "oof_runner.py") if parent_exp else "",
+        })
+    
     with rt.lock:
-        rt.manual_queue.append({"id": exp_name, "prompt": prompt, "base_solution": base})
+        rt.manual_queue.append(item)
     if not rt.worker_running:
         start_worker()
     return {"status": "queued", "id": exp_name}, 200
