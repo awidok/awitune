@@ -960,6 +960,9 @@ if __name__ == "__main__":
             existing = by_fold_idx.get(fold_idx)
             if existing:
                 eid = str(existing.get("name") or "")
+                # Skip completed folds - don't re-queue them
+                if existing.get("status") == "completed":
+                    continue
             else:
                 eid = f"oof_{parent_exp_name}_f{fold_idx}"
                 db.create_experiment(
