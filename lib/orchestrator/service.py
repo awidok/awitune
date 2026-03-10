@@ -708,19 +708,13 @@ class OrchestratorService:
         if isinstance(direct, list):
             sources = [str(x).strip() for x in direct if str(x).strip()]
             if sources:
-                # Resolve: LLM may provide short names; try to match against real experiments
-                resolved = self._resolve_experiment_names(sources)
-                if resolved:
-                    return resolved
-                # If resolution failed, still return the raw sources
                 return sources
 
         base_experiment = str(item.get("base_experiment") or "").strip()
         if "," in base_experiment:
             sources = [x.strip() for x in base_experiment.split(",") if x.strip()]
             if sources:
-                resolved = self._resolve_experiment_names(sources)
-                return resolved or sources
+                return sources
 
         prompt = str(item.get("prompt") or "")
         if not prompt:
@@ -728,51 +722,6 @@ class OrchestratorService:
         all_names = {e.get("name", "") for e in db.get_all_experiments(limit=2000)}
         detected = [name for name in all_names if name and name in prompt]
         return sorted(set(detected))
-
-    def _resolve_experiment_names(self, names: list[str]) -> list[str]:
-        """Resolve potentially abbreviated experiment names to actual DB names.
-
-        The LLM may provide short names like 'diverse_models' instead of the
-        full 'auto_diverse_models_20260310_221853_505342_4'. This method tries
-        exact match first, then substring match.
-        """
-        all_exps = db.get_all_experiments(limit=2000)
-        all_names = {e.get("name", "") for e in all_exps if e.get("name")}
-        resolved = []
-        for name in names:
-            name = name.strip()
-            if not name:
-                continue
-            # Exact match
-            if name in all_names:
-                resolved.append(name)
-                continue
-            # Substring match: find experiments whose name contains the given string
-            matches = [n for n in all_names if name in n]
-            if len(matches) == 1:
-                resolved.append(matches[0])
-                continue
-            # Multiple matches: prefer completed experiments with best score
-            if matches:
-                best = None
-                for m in matches:
-                    exp = next((e for e in all_exps if e.get("name") == m), None)
-                    if not exp:
-                        continue
-                    if exp.get("status") != "completed":
-                        continue
-                    score = exp.get("test_score")
-                    if best is None or (score is not None and (best[1] is None or score > best[1])):
-                        best = (m, score)
-                if best:
-                    resolved.append(best[0])
-                    continue
-                # Fallback: just take the first match
-                resolved.append(matches[0])
-                continue
-            # No match at all — keep original name (will fail later in dependency check)
-            resolved.append(name)
-        return resolved
 
     def _has_ready_oof_for_experiment(self, exp_name: str) -> bool:
         # First check if experiment is completed successfully
@@ -1148,15 +1097,93 @@ if __name__ == "__main__":
                 db.release_oof_lock(parent_exp)
                 db.add_log(parent_exp, "Released stale OOF lock", level="warning")
 
+    def _regenerate_stacking_sources(self, item: dict) -> list[str]:
+        """Ask LLM to regenerate stack_sources with correct experiment names."""
+        try:
+            from ..generate_ideas import configure as configure_ideas, call_openai_with_tools, parse_ideas
+            from ..orchestrator.tools import configure as configure_tools
+
+            configure_ideas(self.rt.cfg)
+            configure_tools(self.rt.cfg)
+
+            # Build list of available completed experiments with scores
+            completed = db.get_all_experiments(limit=200, status="completed")
+            exp_list = []
+            for e in completed:
+                if e.get("task_type") in ("analysis", "oof_fold"):
+                    continue
+                score = e.get("test_score")
+                score_str = f"{score:.6f}" if isinstance(score, (int, float)) else "N/A"
+                exp_list.append(f"- {e['name']} (score={score_str}, family={self._infer_family(e)})")
+
+            if not exp_list:
+                return []
+
+            prompt = (
+                "The orchestrator tried to create a stacking experiment but the stack_sources "
+                "contained invalid experiment names that don't exist in the database.\n\n"
+                f"Original prompt: {item.get('prompt', '')[:500]}\n"
+                f"Original stack_sources (INVALID): {item.get('stack_sources', [])}\n\n"
+                "Here are ALL available completed experiments:\n"
+                + "\n".join(exp_list[:50]) + "\n\n"
+                "Pick 2-5 diverse experiments from the list above for stacking. "
+                "Return ONLY a JSON object with a single key 'stack_sources' containing "
+                "the EXACT experiment names from the list. Example:\n"
+                '{"stack_sources": ["auto_exp_A_20260310_123456_0", "auto_exp_B_20260310_234567_1"]}\n'
+                "Return ONLY valid JSON, no commentary."
+            )
+
+            system = "You are a helper that picks experiment names for stacking. Return only JSON."
+            response = call_openai_with_tools(system, prompt, temperature=0.3, max_retries=2)
+            if not response:
+                return []
+
+            import json
+            text = response.strip()
+            # Try to extract JSON object
+            brace_start = text.find("{")
+            brace_end = text.rfind("}")
+            if brace_start != -1 and brace_end != -1:
+                obj = json.loads(text[brace_start:brace_end + 1])
+                sources = obj.get("stack_sources", [])
+                if isinstance(sources, list):
+                    return [str(x).strip() for x in sources if str(x).strip()]
+            return []
+        except Exception as exc:
+            self.orchestrator_log(f"Failed to regenerate stacking sources: {exc}")
+            return []
+
     def _ensure_stacking_dependencies(self, item: dict) -> bool:
         if item.get("task_type") != "stacking":
             return True
         sources = self._extract_stacking_sources(item)
+
+        # If no sources found, ask LLM to regenerate with correct names
         if not sources:
-            db.add_log(item["id"], "Stacking blocked: no stack_sources found. Provide explicit experiment names.", level="error")
-            return False
+            retry_count = item.get("_source_retry", 0)
+            if retry_count < 1:
+                db.add_log(item["id"], "No valid stack_sources found, asking LLM to regenerate with correct experiment names...")
+                regenerated = self._regenerate_stacking_sources(item)
+                if regenerated:
+                    item["stack_sources"] = regenerated
+                    item["_source_retry"] = retry_count + 1
+                    db.add_log(item["id"], f"LLM regenerated stack_sources: {regenerated}")
+                    sources = regenerated
+                else:
+                    db.add_log(item["id"], "LLM could not regenerate stack_sources. Stacking blocked.", level="error")
+                    # Cancel the experiment instead of infinite re-queue
+                    db.update_experiment(item["id"], status="failed", notes="No valid stack_sources — LLM regeneration failed")
+                    return True  # Return True to not re-queue; experiment is already marked failed
+            else:
+                db.add_log(item["id"], "Stacking blocked after retry: still no valid stack_sources.", level="error")
+                db.update_experiment(item["id"], status="failed", notes="No valid stack_sources after LLM retry")
+                return True  # Don't re-queue
+
+        if not sources:
+            return True  # Already marked as failed above
+
         item["stack_sources"] = sources
-        db.add_log(item["id"], f"Stacking sources resolved: {sources}")
+        db.add_log(item["id"], f"Stacking sources: {sources}")
 
         missing = []
         for source_exp in sources:
