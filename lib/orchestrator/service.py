@@ -14,9 +14,9 @@ from .. import db
 from ..dashboard.runtime import MAX_AUTO_QUEUE_SIZE
 from ..dashboard.proxy import start_proxy as runtime_start_proxy, stop_proxy as runtime_stop_proxy
 from ..notifications import send_telegram_notification
-from .eval import extract_metrics, has_result_event, read_eval_results, run_evaluate
+from .eval import extract_metrics, has_result_event, has_result_in_agent_log, read_eval_results, run_evaluate
 from .queue import collect_used_idea_names, queue_idea
-from .workspace import analyst_reports_dir, prepare_analyst_workspace, prepare_workspace, resolve_base_solution
+from .workspace import analyst_reports_dir, prepare_analyst_workspace, prepare_workspace, prepare_stacking_workspace, resolve_base_solution
 
 OOF_FILE_PATTERNS = (
     "oof_predictions.parquet",
@@ -136,17 +136,23 @@ class OrchestratorService:
 
     @staticmethod
     def _events_file(exp_dir: Path) -> Path:
-        return exp_dir / "events" / "events.jsonl"
-
-    @staticmethod
-    def _legacy_events_file(out_dir: Path) -> Path:
-        return out_dir / "events.jsonl"
+        primary = exp_dir / "events" / "events.jsonl"
+        if primary.exists():
+            return primary
+        fallback = exp_dir / "output" / "events.jsonl"
+        if fallback.exists():
+            return fallback
+        return primary
 
     def _has_result_event_any(self, exp_dir: Path, out_dir: Path) -> bool:
+        # Primary location: exp_dir/events/events.jsonl (agent writes to /app/events/)
         primary = self._events_file(exp_dir)
         if has_result_event(primary):
             return True
-        return has_result_event(self._legacy_events_file(out_dir))
+        # Fallback: check agent.log for result event
+        if has_result_in_agent_log(exp_dir):
+            return True
+        return False
 
     def _cleanup_post_result_processes(self, exp_name: str, container_name: str) -> bool:
         """Stop known background tail/watch loops that can keep container alive after result."""
@@ -252,18 +258,22 @@ class OrchestratorService:
 
             if is_analysis:
                 ws = prepare_analyst_workspace(cfg, exp_dir, prompt)
+            elif is_stacking:
+                stack_sources = (task_payload or {}).get("stack_sources") or []
+                ws = prepare_stacking_workspace(
+                    cfg,
+                    exp_dir,
+                    prompt,
+                    best_score,
+                    prev_exps,
+                    stack_sources=stack_sources,
+                )
             else:
-                effective_prompt = prompt
-                if is_stacking:
-                    effective_prompt = self._build_stacking_prompt(
-                        prompt,
-                        stack_sources=(task_payload or {}).get("stack_sources") or [],
-                    )
                 ws = prepare_workspace(
                     cfg,
                     base_solution or str(cfg.solutions_dir / "baseline"),
                     exp_dir,
-                    effective_prompt,
+                    prompt,
                     best_score,
                     prev_exps,
                     reference_code=reference_code,
@@ -275,6 +285,7 @@ class OrchestratorService:
             out = exp_dir / "output"
             events_dir = exp_dir / "events"
             events_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(events_dir, 0o777)  # Allow agent to write events
             slot_index = int((task_payload or {}).get("slot_index", 0) or 0)
             numa_args = self._docker_numa_args(gpu_id, slot_index)
 
@@ -333,7 +344,7 @@ class OrchestratorService:
 
             db.add_log(exp_name, f"Docker command: {' '.join(cmd[:10])}...")
             lp = exp_dir / "agent.log"
-            events_file = self._events_file(exp_dir)
+            events_file = self._events_file(exp_dir)  # Agent writes to /app/events/events.jsonl
             grace_period = 180
             with open(lp, "w") as lf:
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -697,13 +708,19 @@ class OrchestratorService:
         if isinstance(direct, list):
             sources = [str(x).strip() for x in direct if str(x).strip()]
             if sources:
+                # Resolve: LLM may provide short names; try to match against real experiments
+                resolved = self._resolve_experiment_names(sources)
+                if resolved:
+                    return resolved
+                # If resolution failed, still return the raw sources
                 return sources
 
         base_experiment = str(item.get("base_experiment") or "").strip()
         if "," in base_experiment:
             sources = [x.strip() for x in base_experiment.split(",") if x.strip()]
             if sources:
-                return sources
+                resolved = self._resolve_experiment_names(sources)
+                return resolved or sources
 
         prompt = str(item.get("prompt") or "")
         if not prompt:
@@ -711,6 +728,51 @@ class OrchestratorService:
         all_names = {e.get("name", "") for e in db.get_all_experiments(limit=2000)}
         detected = [name for name in all_names if name and name in prompt]
         return sorted(set(detected))
+
+    def _resolve_experiment_names(self, names: list[str]) -> list[str]:
+        """Resolve potentially abbreviated experiment names to actual DB names.
+
+        The LLM may provide short names like 'diverse_models' instead of the
+        full 'auto_diverse_models_20260310_221853_505342_4'. This method tries
+        exact match first, then substring match.
+        """
+        all_exps = db.get_all_experiments(limit=2000)
+        all_names = {e.get("name", "") for e in all_exps if e.get("name")}
+        resolved = []
+        for name in names:
+            name = name.strip()
+            if not name:
+                continue
+            # Exact match
+            if name in all_names:
+                resolved.append(name)
+                continue
+            # Substring match: find experiments whose name contains the given string
+            matches = [n for n in all_names if name in n]
+            if len(matches) == 1:
+                resolved.append(matches[0])
+                continue
+            # Multiple matches: prefer completed experiments with best score
+            if matches:
+                best = None
+                for m in matches:
+                    exp = next((e for e in all_exps if e.get("name") == m), None)
+                    if not exp:
+                        continue
+                    if exp.get("status") != "completed":
+                        continue
+                    score = exp.get("test_score")
+                    if best is None or (score is not None and (best[1] is None or score > best[1])):
+                        best = (m, score)
+                if best:
+                    resolved.append(best[0])
+                    continue
+                # Fallback: just take the first match
+                resolved.append(matches[0])
+                continue
+            # No match at all — keep original name (will fail later in dependency check)
+            resolved.append(name)
+        return resolved
 
     def _has_ready_oof_for_experiment(self, exp_name: str) -> bool:
         # First check if experiment is completed successfully
@@ -1060,10 +1122,10 @@ if __name__ == "__main__":
                     else:
                         self.rt.auto_queue.append(item)
             self.orchestrator_log(
-                f"Queued {n_folds} external OOF fold task(s) for {parent_exp_name} "
-                f"(queue={'manual' if manual else 'auto'})"
+                f"Queued {len(slots)} external OOF fold task(s) for {parent_exp_name} "
+                f"(queue={'manual' if manual else 'auto'}, fold 4 reuses parent predictions)"
             )
-            return {"status": "queued", "count": n_folds}
+            return {"status": "queued", "count": len(slots)}
         except Exception as exc:
             db.release_oof_lock(parent_exp_name)
             return {"status": "error", "message": f"Failed to queue OOF: {exc}"}
@@ -1091,9 +1153,10 @@ if __name__ == "__main__":
             return True
         sources = self._extract_stacking_sources(item)
         if not sources:
-            db.add_log(item["id"], "Stacking has no explicit sources; running without OOF dependencies", level="warning")
-            return True
+            db.add_log(item["id"], "Stacking blocked: no stack_sources found. Provide explicit experiment names.", level="error")
+            return False
         item["stack_sources"] = sources
+        db.add_log(item["id"], f"Stacking sources resolved: {sources}")
 
         missing = []
         for source_exp in sources:
@@ -1478,14 +1541,17 @@ if __name__ == "__main__":
                         f"Getting ideas (used: {len(used_idea_names)}, need {needed}, stacking_mode={self.rt.cfg.enable_stacking_mode})..."
                     )
                     unused = feeder.get_unused_prompts(used_idea_names, limit=needed)
+                    self.orchestrator_log(f"Got {len(unused)} idea(s) from feeder")
                     unused = self._filter_and_prioritize_auto_ideas(unused, needed)
-                    self.orchestrator_log(f"Got {len(unused)} idea(s)")
+                    self.orchestrator_log(f"After filtering: {len(unused)} idea(s)")
                     queued_now = 0
                     for idx, idea in enumerate(unused):
                         if queue_idea(self.rt, self.rt.cfg, idea, idx, self.resolve_base_solution, self.orchestrator_log):
                             queued_now += 1
                     if queued_now:
                         self.orchestrator_log(f"Queued total: {queued_now}/{len(unused)}")
+                    else:
+                        self.orchestrator_log(f"WARNING: No ideas queued! unused={len(unused)}")
                     time.sleep(2)
                 else:
                     time.sleep(1)
@@ -1640,7 +1706,7 @@ if __name__ == "__main__":
         post_result_grace = 180
         exp_dir = self.rt.cfg.experiments_dir / exp_name
         out_dir = exp_dir / "output"
-        events_file = self._events_file(exp_dir)
+        events_file = self._events_file(exp_dir)  # Agent writes to /app/events/events.jsonl
         agent_done_logged = False
         agent_done_at = None
         last_cleanup_at = 0.0
