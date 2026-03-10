@@ -174,6 +174,80 @@ TOOLS = [
                 "required": ["experiment_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reference_files",
+            "description": "List available reference solution files (winner code, baselines). Use before get_reference_code to know what files exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_experiments",
+            "description": "Search and filter experiments by status, task_type, score range, or name pattern. Returns a compact list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: completed, running, failed, queued (optional)"
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "description": "Filter by task type: experiment, analysis, stacking, oof_fold (optional)"
+                    },
+                    "name_contains": {
+                        "type": "string",
+                        "description": "Filter by name substring (optional)"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum test_score (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default 20)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_experiment_metrics",
+            "description": "Get detailed evaluation metrics (per-target AUC, confusion matrices, etc.) from eval_results.json or metrics.json.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "experiment_name": {
+                        "type": "string",
+                        "description": "Name of the experiment"
+                    }
+                },
+                "required": ["experiment_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_oof_registry",
+            "description": "Get the OOF predictions registry — which experiments have OOF files, their scores, and families. Essential for planning stacking experiments.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
     }
 ]
 
@@ -375,6 +449,108 @@ def get_training_logs(experiment_name: str) -> dict:
         return {"error": f"Failed to parse training logs: {e}"}
 
 
+def list_reference_files() -> dict:
+    """List available reference solution files."""
+    if _cfg is None:
+        return {"error": "Tools not configured"}
+    if _cfg.reference_dir is None:
+        return {"files": [], "message": "No reference directory configured"}
+
+    files = []
+    for subdir in sorted(_cfg.reference_dir.iterdir()):
+        if subdir.is_dir():
+            for f in sorted(subdir.glob("*")):
+                if f.is_file():
+                    files.append({"dir": subdir.name, "file": f.name, "size": f.stat().st_size})
+        elif subdir.is_file():
+            files.append({"dir": "", "file": subdir.name, "size": subdir.stat().st_size})
+    return {"files": files}
+
+
+def search_experiments(
+    status: str = None,
+    task_type: str = None,
+    name_contains: str = None,
+    min_score: float = None,
+    limit: int = 20,
+) -> dict:
+    """Search and filter experiments."""
+    all_exps = db.get_all_experiments(limit=2000)
+    results = []
+    for e in all_exps:
+        if status and e.get("status") != status:
+            continue
+        if task_type and e.get("task_type") != task_type:
+            continue
+        if name_contains and name_contains.lower() not in (e.get("name") or "").lower():
+            continue
+        if min_score is not None:
+            score = e.get("test_score")
+            if score is None or float(score) < min_score:
+                continue
+        results.append({
+            "name": e.get("name"),
+            "status": e.get("status"),
+            "task_type": e.get("task_type"),
+            "test_score": e.get("test_score"),
+            "val_score": e.get("val_score"),
+            "cv_score": e.get("cv_score"),
+            "improved": e.get("improved", False),
+            "parent_experiment": e.get("parent_experiment"),
+            "created_at": e.get("created_at"),
+        })
+        if len(results) >= limit:
+            break
+    return {"experiments": results, "total_matched": len(results)}
+
+
+def get_experiment_metrics(experiment_name: str) -> dict:
+    """Get detailed evaluation metrics from an experiment."""
+    if _cfg is None:
+        return {"error": "Tools not configured"}
+
+    exp_dir = _cfg.experiments_dir / experiment_name
+    for fname in ["eval_results.json", "metrics.json"]:
+        fp = exp_dir / "output" / fname
+        if fp.exists():
+            try:
+                data = json.loads(fp.read_text(errors="replace"))
+                return {"experiment_name": experiment_name, "source": fname, "metrics": data}
+            except json.JSONDecodeError as exc:
+                return {"error": f"Failed to parse {fname}: {exc}"}
+    return {"error": f"No metrics files found for experiment '{experiment_name}'"}
+
+
+def get_oof_registry() -> dict:
+    """Get the OOF predictions registry for stacking planning."""
+    if _cfg is None:
+        return {"error": "Tools not configured"}
+
+    registry_path = _cfg.data_dir / "stacking_oof_registry.json"
+    if not registry_path.exists():
+        return {"entries": [], "message": "No OOF registry yet. Run OOF/CV on experiments first."}
+
+    try:
+        data = json.loads(registry_path.read_text(errors="replace"))
+        if not isinstance(data, list):
+            return {"entries": [], "message": "Invalid registry format"}
+        entries = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            entries.append({
+                "experiment": row.get("experiment"),
+                "score": row.get("score"),
+                "family": row.get("family"),
+                "path_exists": Path(row.get("path", "")).exists(),
+                "folds": row.get("folds"),
+                "splitter": row.get("splitter"),
+            })
+        return {"entries": entries}
+    except Exception as exc:
+        return {"error": f"Failed to read OOF registry: {exc}"}
+
+
 # Dispatch function for tool calls
 def dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
     """Dispatch a tool call to the appropriate function."""
@@ -388,6 +564,10 @@ def dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
         "get_diff_between_experiments": get_diff_between_experiments,
         "list_analyst_reports": list_analyst_reports,
         "get_training_logs": get_training_logs,
+        "list_reference_files": list_reference_files,
+        "search_experiments": search_experiments,
+        "get_experiment_metrics": get_experiment_metrics,
+        "get_oof_registry": get_oof_registry,
     }
     
     handler = handlers.get(tool_name)
