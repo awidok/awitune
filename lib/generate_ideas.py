@@ -438,6 +438,111 @@ def generate_ideas(count: int = 1) -> list[dict]:
         return []
 
 
+SMART_LAUNCH_SYSTEM_PROMPT = """\
+You are an ML experiment planner. The user gives you a free-text instruction describing
+what experiment they want to run. Your job is to convert it into a structured experiment
+definition that the orchestrator can execute.
+
+You have access to TOOLS to fetch detailed information about existing experiments,
+their code, scores, and analyst reports. Use them to understand the current state.
+
+Based on the user's instruction, determine:
+1. **task_type**: "experiment", "analysis", or "stacking"
+2. **base_experiment**: which existing experiment to fork from (or "default" for baseline)
+3. **stack_sources**: if stacking, which experiments to stack (list of experiment names)
+4. **prompt**: detailed technical instructions for the agent that will execute the experiment
+5. **name**: a short snake_case name (max 30 chars)
+6. **reasoning**: why this experiment makes sense
+
+IMPORTANT:
+- If the user mentions stacking/blending/ensembling specific solutions, set task_type="stacking"
+  and fill stack_sources with the experiment names.
+- If the user mentions analyzing data, set task_type="analysis".
+- Otherwise, set task_type="experiment" and pick the best base_experiment.
+- The "prompt" field should be a detailed, actionable instruction for the coding agent.
+  Expand the user's brief instruction into specific technical guidance.
+- You can use tools to look up experiment names, scores, and code to make better decisions.
+
+Return EXACTLY ONE JSON object (not an array). Example:
+{
+  "name": "stack_top3_ridge",
+  "task_type": "stacking",
+  "reasoning": "User wants to stack solutions A, B, C using a ridge meta-learner",
+  "base_experiment": "default",
+  "prompt": "Build a stacking ensemble combining predictions from experiments A, B, C...",
+  "reference_code": null,
+  "stack_sources": ["exp_A", "exp_B", "exp_C"]
+}
+
+Return ONLY valid JSON — no markdown fences, no commentary outside the object.
+"""
+
+
+def generate_smart_idea(user_instruction: str) -> dict | None:
+    """Generate a single experiment idea from a free-text user instruction.
+
+    Uses the existing LLM infrastructure (tools, context) but with a
+    specialised system prompt that converts the user's brief instruction
+    into a fully structured experiment definition.
+    """
+    if not _cfg:
+        raise RuntimeError("generate_ideas module not configured — call configure(cfg) first")
+
+    print(f"[smart_launch] Generating idea from: {user_instruction!r}")
+    ctx = build_compact_context()
+    user_prompt = build_user_prompt(ctx, 1)
+    user_prompt += f"\n\n## USER INSTRUCTION (this is what you must convert into an experiment)\n{user_instruction}\n"
+
+    try:
+        response_text = call_openai_with_tools(SMART_LAUNCH_SYSTEM_PROMPT, user_prompt)
+        print(f"[smart_launch] LLM response: {len(response_text)} chars")
+        if not response_text:
+            print("[smart_launch] WARNING: Empty response from LLM")
+            return None
+
+        # parse_ideas expects an array; smart launch returns a single object
+        text = response_text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+
+        # Try parsing as single object first, then as array
+        bracket_start = text.find("{")
+        bracket_end = text.rfind("}")
+        if bracket_start != -1 and bracket_end != -1:
+            candidate = text[bracket_start:bracket_end + 1]
+            try:
+                idea = json.loads(candidate)
+                if isinstance(idea, dict):
+                    raw_sources = idea.get("stack_sources")
+                    if not isinstance(raw_sources, list):
+                        raw_sources = []
+                    return {
+                        "name": str(idea.get("name", "smart_launch")),
+                        "task_type": str(idea.get("task_type", "experiment")),
+                        "reasoning": str(idea.get("reasoning", "")),
+                        "base_experiment": str(idea.get("base_experiment", "default")),
+                        "prompt": str(idea.get("prompt", user_instruction)),
+                        "reference_code": idea.get("reference_code"),
+                        "stack_sources": [str(x) for x in raw_sources if str(x).strip()],
+                    }
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: try parse_ideas (handles arrays)
+        ideas = parse_ideas(response_text)
+        if ideas:
+            return ideas[0]
+        return None
+    except Exception as e:
+        print(f"[smart_launch] ERROR: {e}")
+        traceback.print_exc()
+        return None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True, help="Path to project directory")

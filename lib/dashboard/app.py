@@ -68,7 +68,7 @@ AWITUNE_DIR = Path(__file__).resolve().parents[2]
 PROXY_HOST = os.getenv("PROXY_HOST", "localhost")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-app = Flask(__name__, template_folder=str(AWITUNE_DIR / "templates"))
+app = Flask(__name__, template_folder=str(AWITUNE_DIR / "templates"), static_folder=str(AWITUNE_DIR / "static"))
 CORS(app)
 
 
@@ -247,6 +247,65 @@ def api_launch():
     if not rt.worker_running:
         start_worker()
     return jsonify({"status": "queued", "id": eid})
+
+
+@app.route("/api/smart_launch", methods=["POST"])
+def api_smart_launch():
+    """Generate an experiment from a free-text instruction via LLM and queue it."""
+    d = request.get_json() or {}
+    user_instruction = (d.get("instruction") or "").strip()
+    if not user_instruction:
+        return jsonify({"status": "error", "message": "No instruction provided"}), 400
+
+    from ..generate_ideas import configure as configure_ideas, generate_smart_idea
+
+    configure_ideas(rt.cfg)
+    idea = generate_smart_idea(user_instruction)
+    if not idea:
+        return jsonify({"status": "error", "message": "LLM failed to generate an experiment definition"}), 500
+
+    # Build experiment from the generated idea
+    idea_name = str(idea.get("name") or "smart")[:30]
+    task_type = str(idea.get("task_type") or "experiment")
+    prompt = str(idea.get("prompt") or user_instruction)
+    base_experiment = str(idea.get("base_experiment") or "default")
+    stack_sources = idea.get("stack_sources") or []
+    if not isinstance(stack_sources, list):
+        stack_sources = []
+    stack_sources = [str(x).strip() for x in stack_sources if str(x).strip()]
+    reasoning = str(idea.get("reasoning") or "")
+
+    base = resolve_base_solution(base_experiment)
+    parent = base_experiment if base_experiment and base_experiment != "default" else ""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", idea_name)[:40]
+    eid = f"smart_{safe_name}_{ts}"
+
+    db.create_experiment(eid, prompt=prompt[:500], base_solution=base, parent_experiment=parent, task_type=task_type)
+    db.add_log(eid, f"Smart launch ({task_type}): {reasoning[:200]}")
+    db.add_log(eid, f"User instruction: {user_instruction[:200]}")
+
+    item = {
+        "id": eid,
+        "prompt": prompt,
+        "base_solution": base,
+        "task_type": task_type,
+        "stack_sources": stack_sources,
+        "reference_code": idea.get("reference_code"),
+    }
+    with rt.lock:
+        rt.manual_queue.append(item)
+    if not rt.worker_running:
+        start_worker()
+
+    return jsonify({
+        "status": "queued",
+        "id": eid,
+        "task_type": task_type,
+        "reasoning": reasoning,
+        "prompt_preview": prompt[:300],
+        "stack_sources": stack_sources,
+    })
 
 
 @app.route("/api/queue/remove", methods=["POST"])

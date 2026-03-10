@@ -211,32 +211,32 @@ def read_events(rt, exp_name):
                         if block.get("type") == "text":
                             events.append({
                                 "type": "text",
-                                "text": block.get("text", "")[:500],
+                                "text": block.get("text", "")[:4000],
                                 "turn": ev.get("turn", "?"),
                             })
                         elif block.get("type") == "tool_use":
                             events.append({
                                 "type": "tool_use",
                                 "tool": block.get("name", "?"),
-                                "input": json.dumps(block.get("input", {}))[:300],
+                                "input": json.dumps(block.get("input", {}))[:2000],
                                 "turn": ev.get("turn", "?"),
                             })
                 elif ev_type == "result":
                     msg = ev.get("result", "")
                     events.append({
                         "type": "result",
-                        "text": (msg if isinstance(msg, str) else json.dumps(msg))[:500],
+                        "text": (msg if isinstance(msg, str) else json.dumps(msg))[:4000],
                     })
                 elif ev_type == "tool_result":
                     events.append({
                         "type": "tool_result",
-                        "output": str(ev.get("output", ""))[:500],
+                        "output": str(ev.get("output", ""))[:4000],
                         "tool": ev.get("tool", "?"),
                     })
                 else:
-                    events.append({"type": ev_type, "raw": json.dumps(ev)[:300]})
+                    events.append({"type": ev_type, "raw": json.dumps(ev)[:2000]})
             except json.JSONDecodeError:
-                events.append({"type": "raw", "text": line[:300]})
+                events.append({"type": "raw", "text": line[:2000]})
     except Exception as exc:
         events.append({"type": "error", "text": str(exc)})
 

@@ -158,7 +158,7 @@ def get_dashboard_experiments(limit=500, status=None):
         SELECT
             name,
             status,
-            substr(prompt, 1, 300) AS prompt,
+            prompt,
             base_solution,
             parent_experiment,
             task_type,
