@@ -248,6 +248,35 @@ TOOLS = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_targetwise_portfolio",
+            "description": "Summarize per-target winners, hard targets, and specialist candidates from completed experiments. Use this to plan target-wise routing and specialist experiments.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_diversity_candidates",
+            "description": "Return diversity-aware stacking candidates grouped by family from the OOF registry. Use this to avoid stacking highly redundant models.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of candidates to return (default 20)"
+                    }
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -522,7 +551,11 @@ def get_experiment_metrics(experiment_name: str) -> dict:
 
 
 def get_oof_registry() -> dict:
-    """Get the OOF predictions registry for stacking planning."""
+    """Get the OOF predictions registry for stacking planning.
+
+    Filters out entries for experiments that no longer exist in the DB
+    or whose OOF files are missing on disk.
+    """
     if _cfg is None:
         return {"error": "Tools not configured"}
 
@@ -538,17 +571,218 @@ def get_oof_registry() -> dict:
         for row in data:
             if not isinstance(row, dict):
                 continue
+            exp_name = row.get("experiment", "")
+            path_exists = Path(row.get("path", "")).exists()
+            # Skip entries with missing OOF files
+            if not path_exists:
+                continue
+            # Skip entries for experiments that no longer exist in DB
+            exp = db.get_experiment(exp_name) if exp_name else None
+            if not exp:
+                continue
+            # Skip OOF fold experiments (they shouldn't be stacking sources)
+            if exp.get("task_type") == "oof_fold":
+                continue
             entries.append({
-                "experiment": row.get("experiment"),
+                "experiment": exp_name,
                 "score": row.get("score"),
                 "family": row.get("family"),
-                "path_exists": Path(row.get("path", "")).exists(),
+                "path_exists": True,
                 "folds": row.get("folds"),
                 "splitter": row.get("splitter"),
+                "status": exp.get("status"),
+                "has_workspace": bool(exp.get("workspace_dir")),
+                "coverage": row.get("coverage"),
+                "oof_rows": row.get("oof_rows"),
             })
         return {"entries": entries}
     except Exception as exc:
         return {"error": f"Failed to read OOF registry: {exc}"}
+
+
+HARD_TARGET_DEFAULTS = [
+    "target_9_6",
+    "target_9_3",
+    "target_6_1",
+    "target_6_2",
+    "target_5_2",
+    "target_10_1",
+    "target_5_1",
+    "target_7_1",
+]
+
+
+def _extract_per_target_auc(metrics: dict) -> dict[str, float]:
+    if not isinstance(metrics, dict):
+        return {}
+
+    candidates = []
+    for key in ("per_target_auc", "per_target_val_auc", "per_target_test_auc"):
+        value = metrics.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    ensemble = metrics.get("ensemble")
+    if isinstance(ensemble, dict):
+        for key in ("per_target_auc", "per_target_val_auc", "per_target_test_auc"):
+            value = ensemble.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+
+    merged: dict[str, float] = {}
+    for candidate in candidates:
+        for target, score in candidate.items():
+            if not isinstance(target, str):
+                continue
+            if not target.startswith("target_"):
+                continue
+            if isinstance(score, (int, float)):
+                merged[target] = float(score)
+    return merged
+
+
+
+def get_targetwise_portfolio() -> dict:
+    """Summarize per-target winners, hard targets, and specialist candidates.
+
+    This gives the idea generator a compact view of which targets are weak,
+    which experiments dominate them, and where specialist routing is likely
+    to pay off.
+    """
+    if _cfg is None:
+        return {"error": "Tools not configured"}
+
+    completed = db.get_all_experiments(limit=2000, status="completed")
+    target_rows: dict[str, list[dict]] = {}
+    experiment_summaries = []
+
+    for exp in completed:
+        exp_name = str(exp.get("name") or "")
+        if not exp_name:
+            continue
+        metrics_payload = get_experiment_metrics(exp_name)
+        metrics = metrics_payload.get("metrics") if isinstance(metrics_payload, dict) else None
+        per_target = _extract_per_target_auc(metrics or {})
+        if not per_target:
+            continue
+
+        family = str(exp.get("task_type") or "experiment")
+        summary = {
+            "experiment": exp_name,
+            "task_type": family,
+            "test_score": exp.get("test_score"),
+            "val_score": exp.get("val_score"),
+            "cv_score": exp.get("cv_score"),
+            "targets": len(per_target),
+        }
+        experiment_summaries.append(summary)
+
+        for target, score in per_target.items():
+            target_rows.setdefault(target, []).append({
+                "experiment": exp_name,
+                "score": score,
+                "task_type": family,
+                "test_score": exp.get("test_score"),
+                "val_score": exp.get("val_score"),
+                "cv_score": exp.get("cv_score"),
+            })
+
+    target_summary = []
+    hard_targets = []
+    specialist_candidates = []
+
+    for target, rows in sorted(target_rows.items()):
+        ranked = sorted(rows, key=lambda r: (r.get("score") is None, -(r.get("score") or -1e9)))
+        best = ranked[0]
+        second = ranked[1] if len(ranked) > 1 else None
+        gap = None
+        if second and isinstance(best.get("score"), (int, float)) and isinstance(second.get("score"), (int, float)):
+            gap = float(best["score"] - second["score"])
+
+        entry = {
+            "target": target,
+            "best_experiment": best.get("experiment"),
+            "best_score": best.get("score"),
+            "best_task_type": best.get("task_type"),
+            "runner_up": second.get("experiment") if second else None,
+            "runner_up_score": second.get("score") if second else None,
+            "gap_to_runner_up": gap,
+            "top3": ranked[:3],
+        }
+        target_summary.append(entry)
+
+        if isinstance(best.get("score"), (int, float)) and best["score"] < 0.82:
+            hard_targets.append(entry)
+        if gap is not None and gap >= 0.01:
+            specialist_candidates.append(entry)
+
+    hard_targets = sorted(
+        hard_targets,
+        key=lambda r: (r.get("best_score") is None, r.get("best_score") if r.get("best_score") is not None else 1e9),
+    )
+    specialist_candidates = sorted(
+        specialist_candidates,
+        key=lambda r: -(r.get("gap_to_runner_up") or 0.0),
+    )
+
+    if not hard_targets:
+        for target in HARD_TARGET_DEFAULTS:
+            if target in target_rows:
+                row = next((r for r in target_summary if r["target"] == target), None)
+                if row:
+                    hard_targets.append(row)
+
+    return {
+        "hard_targets": hard_targets[:12],
+        "specialist_candidates": specialist_candidates[:12],
+        "target_summary": target_summary[:41],
+        "experiments_with_per_target_metrics": experiment_summaries[:100],
+    }
+
+
+
+def get_diversity_candidates(limit: int = 20) -> dict:
+    """Return candidate experiments for diversity-aware stacking/routing.
+
+    The heuristic favors completed experiments with good scores, available OOF,
+    and family diversity so the LLM can choose non-redundant sources.
+    """
+    if _cfg is None:
+        return {"error": "Tools not configured"}
+
+    registry = get_oof_registry()
+    entries = registry.get("entries", []) if isinstance(registry, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+
+    by_family: dict[str, list[dict]] = {}
+    for row in entries:
+        family = str(row.get("family") or "other")
+        exp_name = str(row.get("experiment") or "")
+        exp = db.get_experiment(exp_name) if exp_name else None
+        if not exp or exp.get("status") != "completed":
+            continue
+        enriched = {
+            "experiment": exp_name,
+            "family": family,
+            "score": row.get("score"),
+            "coverage": row.get("coverage"),
+            "task_type": exp.get("task_type"),
+            "val_score": exp.get("val_score"),
+            "cv_score": exp.get("cv_score"),
+        }
+        by_family.setdefault(family, []).append(enriched)
+
+    selected = []
+    for family, rows in sorted(by_family.items()):
+        ranked = sorted(rows, key=lambda r: (r.get("score") is None, -(r.get("score") or -1e9)))
+        selected.extend(ranked[:3])
+
+    selected = sorted(selected, key=lambda r: (r.get("score") is None, -(r.get("score") or -1e9)))
+    return {
+        "candidates": selected[:limit],
+        "families": {family: len(rows) for family, rows in by_family.items()},
+    }
 
 
 # Dispatch function for tool calls
@@ -568,6 +802,8 @@ def dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
         "search_experiments": search_experiments,
         "get_experiment_metrics": get_experiment_metrics,
         "get_oof_registry": get_oof_registry,
+        "get_targetwise_portfolio": get_targetwise_portfolio,
+        "get_diversity_candidates": get_diversity_candidates,
     }
     
     handler = handlers.get(tool_name)

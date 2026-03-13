@@ -538,6 +538,43 @@ class OrchestratorService:
     def _select_diverse_ideas(self, ideas: list[dict], limit: int) -> list[dict]:
         if limit <= 0:
             return []
+
+        def diversity_score(idea: dict) -> tuple[int, int, int]:
+            prompt = str(idea.get("prompt") or "").lower()
+            name = str(idea.get("name") or "").lower()
+            text = f"{name} {prompt}"
+            specialist_markers = (
+                "specialist",
+                "routing",
+                "router",
+                "mixture",
+                "gating",
+                "per-target",
+                "per target",
+                "subgroup",
+                "slice",
+                "hard target",
+                "failure mode",
+            )
+            diversity_markers = (
+                "divers",
+                "family",
+                "stack",
+                "blend",
+                "ensemble",
+                "meta",
+            )
+            analysis_markers = (
+                "analysis",
+                "diagnose",
+                "investigate",
+                "error analysis",
+            )
+            specialist = int(any(marker in text for marker in specialist_markers))
+            diversity = int(any(marker in text for marker in diversity_markers))
+            analysis = int(any(marker in text for marker in analysis_markers))
+            return specialist, diversity, analysis
+
         by_family = {}
         for idx, idea in enumerate(ideas):
             family = self._infer_family(idea)
@@ -548,12 +585,29 @@ class OrchestratorService:
         for family, group in by_family.items():
             if family in seen:
                 continue
-            selected.append(group[0][1])
+            ranked_group = sorted(
+                group,
+                key=lambda pair: (
+                    -diversity_score(pair[1])[0],
+                    -diversity_score(pair[1])[1],
+                    -diversity_score(pair[1])[2],
+                    pair[0],
+                ),
+            )
+            selected.append(ranked_group[0][1])
             seen.add(family)
             if len(selected) >= limit:
                 return selected
 
-        for idea in ideas:
+        ranked_all = sorted(
+            ideas,
+            key=lambda idea: (
+                -diversity_score(idea)[0],
+                -diversity_score(idea)[1],
+                -diversity_score(idea)[2],
+            ),
+        )
+        for idea in ranked_all:
             if len(selected) >= limit:
                 break
             if idea not in selected:
@@ -746,21 +800,30 @@ class OrchestratorService:
         top_rows = available[:20]
 
         registry_lines = []
+        family_counts: dict[str, int] = {}
         for row in top_rows:
             score = row.get("score")
             score_str = f"{score:.6f}" if isinstance(score, (float, int)) else "N/A"
+            family = str(row.get("family", "other") or "other")
+            family_counts[family] = family_counts.get(family, 0) + 1
+            coverage = row.get("coverage")
+            coverage_str = f" | coverage={coverage:.1%}" if isinstance(coverage, (float, int)) else ""
             registry_lines.append(
-                f"- {row.get('experiment')} | score={score_str} | family={row.get('family','other')} | {row.get('path')}"
+                f"- {row.get('experiment')} | score={score_str} | family={family}{coverage_str} | {row.get('path')}"
             )
 
+        family_summary = ", ".join(f"{family}={count}" for family, count in sorted(family_counts.items())) or "none"
         oof_block = "\n".join(registry_lines) if registry_lines else "- no registered OOF files yet"
         stacking_guidance = (
             "## STACKING MODE\n"
             "This run is for stacking/blending. Ignore 'NO stacking' rules.\n"
             f"OOF splitter: {self.rt.cfg.stacking_oof_splitter}, folds: {self.rt.cfg.stacking_oof_folds}.\n"
             "Reuse OOF predictions from previous experiments.\n"
+            "Prefer diversity-aware source selection: do not just pick the top-N most similar models.\n"
+            "When useful, use per-target or subgroup routing if one source clearly dominates a subset.\n"
             "Save OOF to `/app/output/oof_predictions.parquet` (customer_id + predict_*).\n"
             "Save report to `/app/output/report.md` with sources used and per-target AUC.\n\n"
+            f"### Available OOF families\n- {family_summary}\n\n"
             "### Available OOF predictions\n"
             f"{oof_block}\n"
         )

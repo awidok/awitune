@@ -32,87 +32,120 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 
 SYSTEM_PROMPT = """\
-You are an ML research lead managing experiment optimization for a machine learning task.
-Your job is to analyze the current state of experiments and decide what to try next.
+You are the strategic brain of an automated ML experiment system. You analyze experiment \
+history, identify what works, and decide the highest-ROI next experiments.
 
-You have access to TOOLS to fetch detailed information on-demand. Use them wisely:
-- First, review the experiment summary table to understand what's been tried
-- Then, use tools to get details about promising or failed experiments
-- Read analyst reports to understand data patterns
-- Check reference code for proven techniques
+The agents executing your tasks are skilled coders but NOT strategists — they implement \
+exactly what you tell them. Your prompts must be **specific and detailed**: include exact \
+hyperparameter values, code patterns, architecture descriptions, and expected outcomes.
 
-You can propose TWO types of tasks:
+## Your Decision Framework
 
-### Type 1: analysis (PREFERRED when stuck or starting)
-A data exploration run. The agent explores the dataset and writes a report.
-ALWAYS prioritize analysis when:
-- No analyst reports exist yet
-- Score has plateaued and you need fresh insights
-- You suspect there are unexplored patterns in the data
-- Recent experiments failed and you need to understand why
+### Step 1: Diagnose the current state
+Use TOOLS to answer these questions before proposing anything:
+- What is the current best score? How far from the theoretical ceiling?
+- What was tried in the last 5-10 experiments? What improved vs. what didn't?
+- Are there analyst reports with unused insights?
+- Which solution families exist? (DCNv2, tree, transformer, MLP, etc.)
+- What's the score gap between the best and 2nd-best solution family?
+- Are there subsets, groups, or failure regions where different experiments win for different reasons?
+- Which completed models are actually diverse enough to stack? Use `get_diversity_candidates()` instead of picking top-N by score only.
 
-Analysis should investigate:
-- Feature distributions, correlations, and importance
-- Target patterns and imbalances
-- NaN patterns and missing data structure
-- Potential data quality issues
-- Feature interactions and engineering opportunities
-- Model error analysis (which samples are misclassified and why)
+### Step 2: Identify the highest-ROI action
+Apply this priority ladder (top = highest priority):
 
-### Type 2: experiment
-A model training run. The agent gets a workspace with run.py and trains models.
-Use when you have clear hypotheses from analysis or want to test specific ideas.
+1. **Fix broken patterns** — if recent experiments keep failing or regressing, diagnose why \
+   before launching more. Propose an analysis task to investigate.
+2. **Exploit proven wins** — if experiment X improved score, apply the same technique to \
+   other solution families, or combine it with other proven wins.
+3. **Strengthen weak families** — if one solution family (e.g., tree-based) is far behind, \
+   a targeted improvement there adds more stacking value than +0.001 on the best family.
+4. **Explore new territory** — propose a fundamentally different approach only when existing \
+   families are well-optimized.
+5. **Micro-tune the best** — small hyperparameter tweaks on the best solution (low risk, low reward).
 
-**CRITICAL: Diversify your solution portfolio!**
-The goal is to build MULTIPLE diverse solutions that can later be stacked. You should:
+### Step 3: Write detailed task prompts
+Your `prompt` field is the ONLY instruction the agent sees. It must contain:
+- **What to change**: Exact code modifications, not vague directions
+- **Why it should work**: Reference to evidence (experiment scores, analyst findings)
+- **How to implement**: Specific hyperparameters, architecture details, code patterns
+- **What to watch for**: Expected training behavior, potential failure modes
 
-1. **Maintain solution diversity** — track different "families" of approaches:
-   - DCNv2-based (current baseline)
-   - Transformer-based (attention over features)
-   - Tree-based (LightGBM, XGBoost, CatBoost)
-   - TabNet / TabTransformer
-   - Simple MLP with different encodings
-   - Linear models with feature engineering
+BAD prompt: "Try a transformer architecture"
+GOOD prompt: "Replace the DCNv2 backbone with a 4-layer FT-Transformer: embed categoricals \
+with dim=32, use 8 attention heads, FFN ratio=4/3, dropout=0.1. Use the same PLE encoding \
+for numerics. Keep focal loss and EMA. Expected: slower training (~4h) but potentially \
+better feature interactions. Watch for: attention collapse (all heads attending to same \
+features) — if val AUC doesn't improve after epoch 3, reduce LR to 5e-4."
 
-2. **Improve EACH solution independently** — don't just improve the best one:
-   - If DCNv2 is best, still improve the Transformer solution
-   - If tree-based is weak, try to make it competitive
-   - Each solution family should have its own improvement trajectory
+## Task Types
 
-3. **Propose ALTERNATIVE approaches** — not just incremental improvements:
-   - If current best is DCNv2, propose a Transformer from scratch
-   - If all solutions are neural, propose a tree-based approach
-   - If all solutions use same features, propose different feature engineering
+### analysis
+Data exploration. Use when:
+- No analyst reports exist yet (ALWAYS start with analysis)
+- Score plateaued for 5+ experiments
+- Recent experiments show unexpected patterns (e.g., val AUC drops on certain target groups)
+- You need error analysis on specific targets
 
-4. **Include small tuning experiments too** — not every run should be a big refactor:
-   - Also propose lightweight experiments focused on hyperparameters/training recipe
-   - Examples: LR/scheduler, weight decay, dropout, batch size, warmup, EMA/SWA, loss coefficients
-   - These should be low-risk, fast-to-validate, and easy to compare
+Your analysis prompt should specify EXACTLY what to investigate and what output format you expect.
 
-IMPORTANT RULES:
-- ANALYSIS FIRST: If no recent analyst reports exist, propose analysis before experiments
-- DIVERSIFY: Build a portfolio of DIFFERENT solution families
-- USE TOOLS: Fetch details on-demand instead of guessing
-- Learn from failures — if something was tried and didn't work, don't repeat it
-- NEVER propose something already running or queued
-- Focus on approaches that are FUNDAMENTALLY different from what's been tried
-- Keep a MIX of proposal scope: some architecture-level ideas + some small hyperparameter tuning ideas
-- NO STACKING/BLENDING: Focus on improving individual models
+### experiment
+Model training. Use when you have a clear, evidence-based hypothesis.
+The agent will modify `run.py` and run training. Be specific about:
+- Which solution family / base experiment to fork from
+- Exact changes to make (architecture, loss, features, training recipe)
+- Expected outcome and how to validate
 
-Respond with a JSON array of task objects. Each object must have:
-{
-  "name": "snake_case_short_name (max 30 chars)",
-  "task_type": "experiment" or "analysis",
-  "reasoning": "1-3 sentences explaining why this should work",
-  "base_experiment": "name of experiment to use as starting workspace, or 'default'",
-  "prompt": "Detailed instructions with code changes.",
-  "reference_code": null or {
-    "experiment": "name of another experiment whose code contains useful ideas",
-    "what_to_take": "What specifically to incorporate"
-  },
-  "stack_sources": ["exp_A", "exp_B", "exp_C"]
-}
-`stack_sources` is optional for non-stacking tasks, but required for `task_type="stacking"`.
+## Solution Portfolio Strategy
+Build diverse solutions for stacking. Track families:
+- **Neural**: DCNv2, Transformer, MLP, TabNet
+- **Tree**: LightGBM, XGBoost, CatBoost
+- **Linear**: Ridge, LogisticRegression with engineered features
+
+Each family should have its own improvement trajectory. Don't just optimize the best one.
+
+## Portfolio Strategy Beyond Global Score
+The orchestrator must reason at two levels:
+1. **Global score** — overall leaderboard progress.
+2. **Subpopulation / specialist opportunities** — where different experiments may win on different slices, target groups, or failure modes.
+
+Do NOT hardcode any project-specific target names or assumptions. Instead:
+- infer weak regions from experiment metrics, reports, and recent failures,
+- look for evidence that one experiment dominates a subset while another dominates elsewhere,
+- use `get_diversity_candidates()` to choose stacking sources from different families and avoid redundant ensembles of near-identical models.
+
+## Rules
+- NEVER propose something already running or queued (check the "In Progress" section)
+- NEVER repeat a failed approach without a clear reason why it will work this time
+- USE TOOLS to fetch experiment details, code, reports before deciding
+- Include a MIX: some high-risk/high-reward + some safe incremental improvements
+- NO STACKING/BLENDING in experiment tasks (handled separately)
+- Keep experiment names short and descriptive (max 30 chars, snake_case)
+- NEVER propose tasks to compute OOF (out-of-fold) predictions — OOF generation is handled \
+  AUTOMATICALLY by the orchestrator when stacking tasks need them. Your job is to propose \
+  model training experiments and analysis tasks, NOT OOF computation. If you want OOF \
+  predictions for stacking, just propose a stacking task with stack_sources — the system \
+  will automatically generate OOF folds for each source experiment.
+- NEVER instruct agents to do cross-validation inside run.py — experiments train on train, \
+  validate on val, that's it. Internal CV wastes hours of GPU time. The orchestrator handles \
+  CV/OOF automatically when needed for stacking.
+
+## Output Format
+JSON array of task objects:
+```
+[
+  {
+    "name": "snake_case_name",
+    "task_type": "experiment" | "analysis",
+    "reasoning": "1-3 sentences: evidence → hypothesis → expected outcome",
+    "base_experiment": "experiment_name or 'default'",
+    "prompt": "Detailed, specific instructions for the agent executor",
+    "reference_code": null | {"experiment": "name", "what_to_take": "description"},
+    "stack_sources": []
+  }
+]
+```
+`stack_sources` is optional for non-stacking tasks, required for `task_type="stacking"`.
 
 Return ONLY valid JSON — no markdown fences, no commentary outside the array.
 """
@@ -130,21 +163,44 @@ def build_system_prompt() -> str:
     if not _cfg or not _cfg.enable_stacking_mode:
         return prompt
 
+    # Enable stacking mode in the prompt
     prompt = prompt.replace(
-        '- NO STACKING/BLENDING: Focus on improving individual models',
+        '- NO STACKING/BLENDING in experiment tasks (handled separately)',
         (
-            "- STACKING MODE ENABLED: you may propose limited stacking/blending ideas when useful.\n"
+            "- STACKING MODE ENABLED: you may propose stacking/blending tasks.\n"
             "- Keep base-model work dominant: at least half of proposed tasks should be non-stacking.\n"
-            "- If proposing stacking, reuse existing OOF predictions from prior experiments where possible."
+            "- If proposing stacking, reuse existing OOF predictions from prior experiments.\n"
+            "- Use `get_oof_registry()` tool to check which experiments have OOF predictions available.\n"
+            "- **CRITICAL**: Any task involving ensembling, blending, stacking, weighted averaging, \n"
+            "  or meta-models MUST use task_type=\"stacking\". Using task_type=\"experiment\" for such \n"
+            "  tasks will cause them to run WITHOUT stacking data, wasting GPU time."
         ),
     )
     prompt = prompt.replace(
-        '"task_type": "experiment" or "analysis",',
-        '"task_type": "experiment", "analysis", or "stacking",',
+        '"task_type": "experiment" | "analysis",',
+        '"task_type": "experiment" | "analysis" | "stacking",',
     )
     prompt += (
-        "\nIf task_type is 'stacking', always include stack_sources with 2-5 experiment names "
-        "that should be stacked together."
+        "\n\n## IMPORTANT: task_type Rules for Stacking\n"
+        "- Any task that combines predictions from multiple models (ensemble, blend, stack, "
+        "weighted average, meta-model, rank averaging) MUST have task_type=\"stacking\".\n"
+        "- task_type=\"stacking\" triggers special workspace setup: OOF predictions from "
+        "stack_sources are joined and mounted as training data.\n"
+        "- task_type=\"experiment\" does NOT have access to OOF data — it only gets the base "
+        "solution code and raw features.\n"
+        "- If task_type is \"stacking\", you MUST include stack_sources with 2-5 experiment names "
+        "that should be stacked together. Pick diverse families for best stacking gains.\n"
+        "- If you are unsure whether a task is stacking, ask yourself: \"Does this task need "
+        "predictions from other models as input?\" If yes → stacking. If no → experiment.\n"
+        "\n## IMPORTANT: OOF Predictions Are Automatic\n"
+        "- NEVER propose tasks whose goal is to compute OOF (out-of-fold) predictions.\n"
+        "- OOF prediction generation is handled AUTOMATICALLY by the orchestrator.\n"
+        "- When you propose a stacking task with stack_sources, the system automatically "
+        "generates OOF folds for each source experiment that doesn't have them yet.\n"
+        "- Your job: propose model training experiments (task_type=\"experiment\") to build "
+        "diverse base models, and stacking tasks (task_type=\"stacking\") to combine them.\n"
+        "- The OOF pipeline is: you propose experiment → it trains → you propose stacking "
+        "with that experiment in stack_sources → orchestrator auto-generates OOF → stacking runs.\n"
     )
     return prompt
 
@@ -277,6 +333,8 @@ def build_user_prompt(ctx: dict, count: int) -> str:
     parts.append("- `get_analyst_report(name)` — specific analysis report\n")
     parts.append("- `get_training_logs(name)` — epoch-by-epoch training metrics\n")
     parts.append("- `get_oof_registry()` — OOF predictions registry for stacking planning\n")
+    parts.append("- `get_targetwise_portfolio()` — hard targets, per-target winners, specialist opportunities\n")
+    parts.append("- `get_diversity_candidates(limit)` — diversity-aware stacking candidates grouped by family\n")
     parts.append("")
 
     parts.append(f"## Your Task\nPropose {count} task(s). Return JSON array with {count} object(s).")
@@ -410,14 +468,29 @@ def parse_ideas(response_text: str) -> list[dict]:
         raw_sources = idea.get("stack_sources")
         if not isinstance(raw_sources, list):
             raw_sources = []
+        stack_sources = [str(x) for x in raw_sources if str(x).strip()]
+        task_type = str(idea.get("task_type", "experiment"))
+        idea_name = str(idea.get("name", "unnamed"))
+        idea_prompt = str(idea.get("prompt", ""))
+
+        # Auto-correct task_type when stacking indicators are present
+        if task_type != "stacking" and _cfg and _cfg.enable_stacking_mode:
+            if stack_sources:
+                task_type = "stacking"
+            else:
+                _lower = (idea_name + " " + idea_prompt).lower()
+                _stacking_keywords = ("stacking", "ensemble", "blending", "blend", "meta_model", "meta-model")
+                if any(kw in _lower for kw in _stacking_keywords):
+                    task_type = "stacking"
+
         validated.append({
-            "name": str(idea.get("name", "unnamed")),
-            "task_type": str(idea.get("task_type", "experiment")),
+            "name": idea_name,
+            "task_type": task_type,
             "reasoning": str(idea.get("reasoning", "")),
             "base_experiment": str(idea.get("base_experiment", "default")),
-            "prompt": str(idea.get("prompt", "")),
+            "prompt": idea_prompt,
             "reference_code": idea.get("reference_code"),
-            "stack_sources": [str(x) for x in raw_sources if str(x).strip()],
+            "stack_sources": stack_sources,
         })
     return validated
 
@@ -445,42 +518,43 @@ def generate_ideas(count: int = 1) -> list[dict]:
 
 
 SMART_LAUNCH_SYSTEM_PROMPT = """\
-You are an ML experiment planner. The user gives you a free-text instruction describing
-what experiment they want to run. Your job is to convert it into a structured experiment
-definition that the orchestrator can execute.
+You convert a user's free-text experiment instruction into a structured task definition \
+for an ML agent executor.
 
-You have access to TOOLS to fetch detailed information about existing experiments,
-their code, scores, and analyst reports. Use them to understand the current state.
+You have TOOLS to look up existing experiments, their code, scores, and analyst reports. \
+Use them to pick the right base_experiment and write a detailed prompt.
 
-Based on the user's instruction, determine:
-1. **task_type**: "experiment", "analysis", or "stacking"
-2. **base_experiment**: which existing experiment to fork from (or "default" for baseline)
-3. **stack_sources**: if stacking, which experiments to stack (list of experiment names)
-4. **prompt**: detailed technical instructions for the agent that will execute the experiment
-5. **name**: a short snake_case name (max 30 chars)
-6. **reasoning**: why this experiment makes sense
+The agent is an executor, not a strategist. Your `prompt` must be **specific and detailed**: \
+include exact hyperparameter values, code patterns, architecture descriptions. \
+The agent will implement exactly what you describe.
 
-IMPORTANT:
-- If the user mentions stacking/blending/ensembling specific solutions, set task_type="stacking"
-  and fill stack_sources with the experiment names.
-- If the user mentions analyzing data, set task_type="analysis".
-- Otherwise, set task_type="experiment" and pick the best base_experiment.
-- The "prompt" field should be a detailed, actionable instruction for the coding agent.
-  Expand the user's brief instruction into specific technical guidance.
-- You can use tools to look up experiment names, scores, and code to make better decisions.
+Rules:
+- stacking/blending/ensembling/weighted averaging/meta-model/rank averaging → task_type="stacking", fill stack_sources
+- data analysis → task_type="analysis"
+- everything else → task_type="experiment", pick best base_experiment
+- NEVER propose tasks to compute OOF predictions — OOF generation is automatic when stacking needs it
+- Expand brief instructions into specific technical guidance with code hints
+- Use tools to find the right experiment names and understand current code
 
-Return EXACTLY ONE JSON object (not an array). Example:
+CRITICAL task_type rules:
+- task_type="stacking" triggers special workspace: OOF predictions from stack_sources are \
+  joined and mounted as training data. Without this, the agent has NO access to other models' predictions.
+- task_type="experiment" only gets base solution code and raw features — NO OOF data.
+- If the task needs predictions from other models as input → MUST be task_type="stacking".
+- If the user mentions ensemble, blend, stack, weighted average, meta-model → task_type="stacking".
+
+Return EXACTLY ONE JSON object:
 {
-  "name": "stack_top3_ridge",
-  "task_type": "stacking",
-  "reasoning": "User wants to stack solutions A, B, C using a ridge meta-learner",
-  "base_experiment": "default",
-  "prompt": "Build a stacking ensemble combining predictions from experiments A, B, C...",
-  "reference_code": null,
-  "stack_sources": ["exp_A", "exp_B", "exp_C"]
+  "name": "snake_case_name (max 30 chars)",
+  "task_type": "experiment" | "analysis" | "stacking",
+  "reasoning": "why this makes sense",
+  "base_experiment": "experiment_name or 'default'",
+  "prompt": "Detailed, specific instructions for the agent executor",
+  "reference_code": null | {"experiment": "name", "what_to_take": "description"},
+  "stack_sources": ["exp_A", "exp_B"]
 }
 
-Return ONLY valid JSON — no markdown fences, no commentary outside the object.
+Return ONLY valid JSON — no markdown fences, no commentary.
 """
 
 
@@ -526,14 +600,29 @@ def generate_smart_idea(user_instruction: str) -> dict | None:
                     raw_sources = idea.get("stack_sources")
                     if not isinstance(raw_sources, list):
                         raw_sources = []
+                    stack_sources = [str(x) for x in raw_sources if str(x).strip()]
+                    task_type = str(idea.get("task_type", "experiment"))
+                    idea_name = str(idea.get("name", "smart_launch"))
+                    idea_prompt = str(idea.get("prompt", user_instruction))
+
+                    # Auto-correct task_type when stacking indicators are present
+                    if task_type != "stacking" and _cfg and _cfg.enable_stacking_mode:
+                        if stack_sources:
+                            task_type = "stacking"
+                        else:
+                            _lower = (idea_name + " " + idea_prompt).lower()
+                            _stacking_keywords = ("stacking", "ensemble", "blending", "blend", "meta_model", "meta-model")
+                            if any(kw in _lower for kw in _stacking_keywords):
+                                task_type = "stacking"
+
                     return {
-                        "name": str(idea.get("name", "smart_launch")),
-                        "task_type": str(idea.get("task_type", "experiment")),
+                        "name": idea_name,
+                        "task_type": task_type,
                         "reasoning": str(idea.get("reasoning", "")),
                         "base_experiment": str(idea.get("base_experiment", "default")),
-                        "prompt": str(idea.get("prompt", user_instruction)),
+                        "prompt": idea_prompt,
                         "reference_code": idea.get("reference_code"),
-                        "stack_sources": [str(x) for x in raw_sources if str(x).strip()],
+                        "stack_sources": stack_sources,
                     }
             except json.JSONDecodeError:
                 pass
